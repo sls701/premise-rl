@@ -1,0 +1,16 @@
+provider: local
+model: Qwen/Qwen3-4B
+temperature: 0.0
+max_tokens: 512
+concurrency: 4
+use_vllm: false
+
+# MDP hyperparameters
+horizon: 6
+top_k: 10
+alpha: 0.1
+beta: 1.0
+
+# Paths
+cache_dir: cache/search
+results_dir: results

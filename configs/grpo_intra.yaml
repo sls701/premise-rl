@@ -1,0 +1,43 @@
+run_name: grpo_intra
+
+# Data
+table: rl_train
+# NOTE: corpus has only 4 intra-paper deps out of ~79K total — intra-only
+# filtering yields an empty training set. Both stages train on true_dep_ids.
+# Two-stage schedule is preserved as lr warmup (1e-6) → refinement (5e-7).
+use_intra: false   # reward on true_dep_ids (intra stage collapsed into inter)
+
+# Model (pin snapshot — never use moving alias)
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GRPO hyperparameters — tuned for 97 GB VRAM (RTX PRO 6000 Blackwell)
+group_size: 16       # batched: 16 rollouts in one model.generate call
+temperature: 0.7
+kl_coef: 0.04
+lr: 1.0e-6
+batch_size: 2        # 2 targets per rollout batch (32 sequences total)
+grad_accum: 4        # effective targets per step = batch_size * grad_accum = 8
+epochs: 3
+max_completion_length: 128   # tool calls are ~40 tokens; cap to limit sequence growth
+seed: 42
+
+# MDP
+horizon: 6
+top_k: 10
+alpha: 0.1
+beta: 1.0
+
+# Checkpointing / logging
+save_steps: 100
+logging_steps: 10
+use_wandb: false
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

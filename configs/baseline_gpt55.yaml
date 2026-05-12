@@ -1,0 +1,15 @@
+provider: openai
+model: gpt-5.5-2026-04-23
+temperature: null  # gpt-5.5 only supports default temperature
+max_tokens: 1024
+concurrency: 8
+
+# MDP hyperparameters
+horizon: 6
+top_k: 10
+alpha: 0.1
+beta: 1.0
+
+# Paths
+cache_dir: cache/search
+results_dir: results

@@ -1,0 +1,43 @@
+run_name: grpo_inter
+
+# Data
+table: rl_train
+use_intra: false   # reward on all true_dep_ids (intra + inter)
+
+# Model
+model: Qwen/Qwen3-4B
+
+# Resume from best intra checkpoint — set at launch time
+# resume_from: checkpoints/grpo_intra/step_300
+
+# LoRA (same architecture as intra)
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GRPO hyperparameters (lower lr for refinement) — 97 GB VRAM
+group_size: 16
+temperature: 0.7
+kl_coef: 0.04
+lr: 5.0e-7
+batch_size: 2
+grad_accum: 4
+epochs: 3
+max_completion_length: 256
+seed: 42
+
+# MDP
+horizon: 6
+top_k: 10
+alpha: 0.1
+beta: 1.0
+
+# Checkpointing / logging
+save_steps: 100
+logging_steps: 10
+use_wandb: false
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints
