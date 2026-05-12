@@ -79,13 +79,13 @@ class PremiseSelectionEnv:
 
         results = await self._client.search(query, self.top_k)
 
-        # rapidfuzz.process.extract() is synchronous C code that blocks the
-        # event loop. Run all 10 mappings in the default executor so other
-        # concurrent step() coroutines can proceed.
+        # rapidfuzz.process.cdist() is synchronous C code that blocks the
+        # event loop. Run a single batched call (10 results × ~10K choices)
+        # in the executor so other concurrent step() coroutines can proceed.
         _loop = asyncio.get_running_loop()
         _matcher = self._matcher
         mapped: list[MatchResult] = await _loop.run_in_executor(
-            None, lambda: [_matcher.map_int_to_uuid(r) for r in results]
+            None, _matcher.map_batch, results
         )
 
         new_uuids: set[UUID] = set()

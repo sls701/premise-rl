@@ -1,20 +1,14 @@
 import asyncio
 import logging
-import threading
 import time as _time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import diskcache
-import requests as _requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
 SEARCH_URL = "https://api.theoremsearch.com/search"
-
-# Executor for blocking HTTP calls. max_workers >= concurrency * 2 to absorb
-# retries without queuing: 4 concurrent slots × 2 (retry overlap) = 8 minimum.
-_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="search")
 
 
 @dataclass
@@ -50,67 +44,49 @@ def _make_result(item: dict) -> SearchResult:
     )
 
 
-def _sync_post(payload: dict, total_timeout: float) -> list:
-    """HTTP POST with a hard wall-clock deadline via thread.join().
-
-    requests.post(timeout=N) is a per-read socket timeout: if the server
-    trickles the response body one chunk every N-1 seconds, the request runs
-    forever. This wrapper spawns a daemon thread and joins it with a hard
-    wall-clock limit — thread.join(timeout) always fires on wall-clock time,
-    independent of the asyncio event loop or socket-level keepalives.
-    """
-    result: list = [[]]
-    exc_holder: list = [None]
-
-    def _run() -> None:
-        try:
-            per_read = max(5.0, total_timeout / 3)
-            resp = _requests.post(SEARCH_URL, json=payload, timeout=per_read)
-            resp.raise_for_status()
-            data = resp.json()
-            result[0] = (
-                data.get("theorems")
-                or data.get("results")
-                or (data if isinstance(data, list) else [])
-            )
-        except Exception as exc:
-            exc_holder[0] = exc
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=total_timeout)
-
-    if t.is_alive():
-        raise TimeoutError(f"search request exceeded {total_timeout}s wall-clock limit")
-    if exc_holder[0] is not None:
-        raise exc_holder[0]
-    return result[0]
-
-
 class SearchClient:
+    """Async search client with httpx and asyncio-native timeouts.
+
+    asyncio.timeout() is used instead of threading.Thread.join() — it
+    participates in the event loop's cancellation machinery and is reliable
+    even when model.generate() briefly blocks the loop between await points.
+    Slow or trickle-response servers are cut off after request_timeout seconds.
+    """
+
     def __init__(
         self,
         cache_dir: str = "cache/search",
-        concurrency: int = 4,
+        concurrency: int = 16,
         request_timeout: float = 30.0,
     ):
         self._cache = diskcache.Cache(cache_dir, size_limit=10 * 2**30)
         self._concurrency = concurrency
         self._request_timeout = request_timeout
         self._semaphore: asyncio.Semaphore | None = None
+        self._http: httpx.AsyncClient | None = None
+
+    def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            # HTTP/1.1 with a generous connection pool. HTTP/2 serializes
+            # multiplexed requests on the single TCP connection server-side,
+            # so 8 concurrent requests took 10s in benchmark vs 5.87s on
+            # HTTP/1.1 across multiple keep-alive connections.
+            limits = httpx.Limits(max_connections=32, max_keepalive_connections=32)
+            self._http = httpx.AsyncClient(
+                timeout=self._request_timeout,
+                limits=limits,
+            )
+        return self._http
 
     async def search(self, query: str, k: int) -> list[SearchResult]:
         cache_key = (query, k)
         loop = asyncio.get_running_loop()
 
-        # Cache lookup in executor — diskcache.get() holds a SQLite lock that
-        # would block the event loop if called directly.
         cached = await loop.run_in_executor(None, self._cache.get, cache_key)
         if cached is not None:
             logger.debug("search cache hit  query=%r", query[:120])
             return cached
 
-        # Lazy semaphore — must be created inside a running event loop.
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._concurrency)
 
@@ -120,10 +96,14 @@ class SearchClient:
             for attempt in range(3):
                 _t0 = _time.monotonic()
                 try:
-                    # _sync_post enforces a wall-clock hard deadline internally
-                    # via thread.join(); no asyncio.timeout needed here.
-                    items = await loop.run_in_executor(
-                        _executor, _sync_post, payload, self._request_timeout
+                    async with asyncio.timeout(self._request_timeout):
+                        resp = await self._get_http().post(SEARCH_URL, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    items = (
+                        data.get("theorems")
+                        or data.get("results")
+                        or (data if isinstance(data, list) else [])
                     )
                     results = [_make_result(item) for item in items]
                     elapsed = _time.monotonic() - _t0
@@ -146,11 +126,17 @@ class SearchClient:
                         "search attempt=%d failed (%.2fs): %s  retry in %ds",
                         attempt, elapsed, exc, wait,
                     )
+                    # Recreate client after a failed/cancelled request
+                    if self._http and not self._http.is_closed:
+                        await self._http.aclose()
+                    self._http = None
                     await asyncio.sleep(wait)
 
         return []
 
     async def close(self) -> None:
+        if self._http and not self._http.is_closed:
+            await self._http.aclose()
         self._cache.close()
 
     async def __aenter__(self) -> "SearchClient":

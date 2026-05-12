@@ -1,4 +1,4 @@
-run_name: reinforce_intra
+run_name: gspo_intra
 
 # Data
 table: rl_train
@@ -13,10 +13,10 @@ lora_rank: 16
 lora_alpha: 32
 lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
-# REINFORCE hyperparameters — tuned for 97 GB VRAM (RTX PRO 6000 Blackwell)
+# GSPO hyperparameters
 group_size: 4        # 4 rollouts per target; within-group advantage normalisation
 temperature: 0.7
-ema_decay: 0.99      # EMA baseline decay (only used when group_size == 1)
+clip_eps: 0.2        # PPO-style clipping on sequence-level importance ratio
 lr: 1.0e-6
 batch_size: 2        # 2 targets per rollout batch (8 sequences total)
 grad_accum: 4        # effective targets per optimizer step = 8
@@ -33,7 +33,6 @@ beta: 1.0
 # Checkpointing / logging
 save_steps: 100
 logging_steps: 1
-use_wandb: false
 
 # Paths
 cache_dir: cache

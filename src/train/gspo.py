@@ -1,17 +1,28 @@
 """
-REINFORCE training loop — multi-step episode implementation.
+GSPO training loop — Group Sequence Policy Optimization.
 
-Each training step:
-  1. Roll out G episodes per target using the current policy (no grad).
-     asyncio.run() is called fresh per batch so torch ops never block search callbacks.
-  2. Compute within-group advantages (mean/std normalisation over G rewards).
-     Falls back to an EMA baseline when group_size == 1.
-  3. For each (episode, step): forward pass under current policy → policy gradient.
-     No reference-model forward pass — REINFORCE, not GRPO.
-  4. Accumulate gradients across grad_accum batches, then optimizer.step().
+Reference: https://arxiv.org/abs/2507.18071 (Qwen/Alibaba)
+
+Key difference from GRPO: importance ratio is sequence-level with length
+normalization, not per-token:
+
+    s_i(θ) = exp( (1/|y_i|) * Σ_t log(π_θ(t) / π_old(t)) )
+
+This is the geometric mean of per-token ratios, preventing long sequences
+from numerically dominating.  Loss per episode:
+
+    L = -min( s_i * Â_i,  clip(s_i, 1-ε, 1+ε) * Â_i )
+
+Advantages are within-group (mean/std over G rollouts), same as GRPO.
+
+Structure mirrors src/train/grpo.py (REINFORCE):
+  - asyncio.run() is called fresh per batch — torch ops never block search
+    callbacks.
+  - The reference policy is the base model (LoRA adapters disabled via
+    model.disable_adapter()).  Only the update step differs from REINFORCE.
 
 Launch:
-    python -m src.train.grpo --config configs/grpo_intra.yaml
+    python -m src.train.gspo --config configs/gspo_intra.yaml
 """
 from __future__ import annotations
 
@@ -26,17 +37,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
-import concurrent.futures
-
 import torch
 import torch.nn.functional as F
 import yaml
-
-# Single-worker executor so model.generate() runs in a thread, leaving the
-# asyncio event loop live to drain search-API responses immediately instead
-# of waiting behind the 2-3s blocking GPU call. One worker => CUDA ops are
-# serialised, no concurrent-allocator deadlock.
-_GENERATE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,7 +117,7 @@ def _parse_query(text: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Batched group rollout
+# Batched group rollout (identical to grpo.py — kept self-contained)
 # ---------------------------------------------------------------------------
 
 async def _run_group_batched(
@@ -133,10 +136,6 @@ async def _run_group_batched(
     max_new_tokens: int,
     device,
 ) -> list[EpisodeRecord]:
-    """
-    Run group_size episodes for one target with a single batched generate call
-    per horizon step. env.step() calls are dispatched concurrently via asyncio.
-    """
     from src.env.environment import PremiseSelectionEnv
     from src.env.prompts import format_state
     import time as _time
@@ -184,21 +183,15 @@ async def _run_group_batched(
                     _turn, len(active), list(input_ids.shape), _time.monotonic() - _t0)
 
         _tg = _time.monotonic()
-        _loop = asyncio.get_running_loop()
-        _ids, _mask = input_ids, attn_mask  # capture for the lambda
-
-        def _do_generate() -> torch.Tensor:
-            with torch.no_grad():
-                return model.generate(
-                    _ids,
-                    attention_mask=_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-
-        out = await _loop.run_in_executor(_GENERATE_EXECUTOR, _do_generate)
+        with torch.no_grad():
+            out = model.generate(
+                input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
         logger.info("turn=%d  generate done  shape=%s  gen=%.2fs",
                     _turn, list(out.shape), _time.monotonic() - _tg)
 
@@ -212,9 +205,7 @@ async def _run_group_batched(
             completion_ids_list.append(c_ids)
 
         del out, input_ids, attn_mask, enc
-        # empty_cache() must NOT run here while the executor may be running
-        # the next batched generate() — both contend for the CUDA allocator
-        # lock and deadlock. PyTorch handles cache reuse automatically.
+        torch.cuda.empty_cache()
 
         completion_texts = [
             tokenizer.decode(c, skip_special_tokens=True)
@@ -281,32 +272,35 @@ async def _run_group_batched(
 
 
 # ---------------------------------------------------------------------------
-# REINFORCE update — no reference model, within-group or EMA baseline
+# GSPO update step
 # ---------------------------------------------------------------------------
 
-def reinforce_update_step(
+def gspo_update_step(
     model,
     episode_groups: list[list[EpisodeRecord]],
-    baseline: list[float],
-    ema_decay: float,
     device: torch.device,
+    clip_eps: float = 0.2,
 ) -> dict:
     """
-    Accumulate REINFORCE gradients over episode_groups.
+    GSPO gradient update over episode_groups.
 
-    Advantage per episode:
-      - group_size > 1: within-group (R - mean) / (std + eps)  [degenerate groups skipped]
-      - group_size == 1: R - EMA_baseline, then update EMA
+    For each episode:
+      1. Compute per-token log-ratio:  log π_θ(t) - log π_old(t)
+         where π_old = base model (LoRA adapters disabled, no grad).
+      2. Length-normalised sequence ratio:
+             s_i = exp( mean_t[ log π_θ(t) - log π_old(t) ] )
+      3. Within-group advantage Â_i = (r_i - mean_r) / std_r.
+      4. Clipped surrogate: -min(s_i * Â_i, clip(s_i, 1-ε, 1+ε) * Â_i).
 
-    One forward pass per (episode, step) at shape [1, seq_len].
-    No reference-model forward pass.
-    Assumes optimizer.zero_grad() was called before this function.
+    Degenerate groups (all rewards identical) are skipped — no gradient signal.
+    Assumes optimizer.zero_grad() was already called.
     Does NOT call optimizer.step().
     """
     all_rewards = [ep.total_reward for group in episode_groups for ep in group]
     if not all_rewards:
-        return {"loss": 0.0, "mean_reward": 0.0, "baseline": baseline[0]}
+        return {"loss": 0.0, "mean_reward": 0.0}
 
+    # Count non-empty steps for loss normalisation
     total_steps = sum(
         1
         for group in episode_groups
@@ -315,7 +309,7 @@ def reinforce_update_step(
         if step.completion_ids
     )
     if total_steps == 0:
-        return {"loss": 0.0, "mean_reward": sum(all_rewards) / len(all_rewards), "baseline": baseline[0]}
+        return {"loss": 0.0, "mean_reward": sum(all_rewards) / len(all_rewards)}
 
     total_loss_val = 0.0
     degenerate_groups = 0
@@ -323,45 +317,67 @@ def reinforce_update_step(
     for group in episode_groups:
         if not group:
             continue
+
         rewards = [ep.total_reward for ep in group]
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
-
-        if len(group) > 1:
-            std_r = rewards_t.std().item()
-            if std_r < 1e-8:
-                degenerate_groups += 1
-                continue
-            mean_r = rewards_t.mean().item()
-            advantages = [(r - mean_r) / (std_r + 1e-8) for r in rewards]
-        else:
-            b = baseline[0]
-            advantages = [rewards[0] - b]
-            baseline[0] = ema_decay * b + (1 - ema_decay) * rewards[0]
+        std_r = rewards_t.std().item()
+        if std_r < 1e-8:
+            degenerate_groups += 1
+            continue
+        mean_r = rewards_t.mean().item()
+        advantages = [(r - mean_r) / (std_r + 1e-8) for r in rewards]
 
         for ep_idx, ep in enumerate(group):
             adv = advantages[ep_idx]
+
             for step in ep.steps:
                 if not step.completion_ids:
                     continue
 
                 n_p = len(step.prompt_ids)
                 n_c = len(step.completion_ids)
+
                 seq = torch.tensor(
                     step.prompt_ids + step.completion_ids,
                     dtype=torch.long, device=device,
-                ).unsqueeze(0)
+                ).unsqueeze(0)                                      # [1, n_p+n_c]
                 seq_attn = torch.ones(1, n_p + n_c, device=device)
+                comp_ids_t = torch.tensor(
+                    step.completion_ids, dtype=torch.long, device=device,
+                )                                                   # [n_c]
 
-                logits = model(seq, attention_mask=seq_attn).logits
-                comp_ids_t = torch.tensor(step.completion_ids, dtype=torch.long, device=device)
-                log_probs = F.log_softmax(logits[0, n_p - 1: n_p + n_c - 1].float(), dim=-1)
-                token_lp = log_probs[range(n_c), comp_ids_t].mean()
+                # ---- Current policy (with grad) ----
+                logits = model(seq, attention_mask=seq_attn).logits  # [1, seq_len, V]
+                cur_lp = F.log_softmax(
+                    logits[0, n_p - 1: n_p + n_c - 1].float(), dim=-1
+                )                                                   # [n_c, V]
+                cur_token_lp = cur_lp[range(n_c), comp_ids_t]      # [n_c]
 
-                loss = (-adv * token_lp) / total_steps
-                loss.backward()
-                total_loss_val += loss.item()
+                # ---- Reference policy (base model, no grad) ----
+                with model.disable_adapter(), torch.no_grad():
+                    ref_logits = model(seq, attention_mask=seq_attn).logits
+                ref_lp = F.log_softmax(
+                    ref_logits[0, n_p - 1: n_p + n_c - 1].float(), dim=-1
+                )
+                ref_token_lp = ref_lp[range(n_c), comp_ids_t]      # [n_c]
 
-                del seq, seq_attn, logits, comp_ids_t, log_probs
+                # ---- Length-normalised sequence importance ratio ----
+                # s_i = exp( mean_t[ log π_θ(t) - log π_old(t) ] )
+                mean_log_ratio = (cur_token_lp - ref_token_lp.detach()).mean()
+                mean_log_ratio = mean_log_ratio.clamp(-10.0, 10.0)  # numerical guard
+                s_i = mean_log_ratio.exp()                           # scalar, has grad
+
+                # ---- Clipped surrogate (PPO-style) ----
+                s_i_clipped = s_i.clamp(1.0 - clip_eps, 1.0 + clip_eps)
+                surr1 = s_i * adv
+                surr2 = s_i_clipped * adv
+                step_loss = -torch.min(surr1, surr2) / total_steps
+
+                step_loss.backward()
+                total_loss_val += step_loss.item()
+
+                del seq, seq_attn, logits, ref_logits, comp_ids_t
+                del cur_lp, ref_lp, cur_token_lp, ref_token_lp
 
     if degenerate_groups:
         logger.warning("degenerate_groups=%d (all rewards tied — no gradient signal)", degenerate_groups)
@@ -369,7 +385,6 @@ def reinforce_update_step(
     return {
         "loss": total_loss_val,
         "mean_reward": sum(all_rewards) / len(all_rewards),
-        "baseline": baseline[0],
         "degenerate_groups": degenerate_groups,
     }
 
@@ -400,7 +415,7 @@ def main() -> None:
 
     cache_dir = cfg.get("cache_dir", "cache")
     checkpoint_dir = (
-        Path(cfg.get("checkpoint_dir", "checkpoints")) / cfg.get("run_name", "reinforce")
+        Path(cfg.get("checkpoint_dir", "checkpoints")) / cfg.get("run_name", "gspo")
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     system_prompt = Path("configs/prompts/premise_selection.txt").read_text()
@@ -412,7 +427,6 @@ def main() -> None:
     targets_list = list(targets_dict.values())
     if use_intra:
         targets_list = [t for t in targets_list if t.intra_dep_ids]
-        logger.info("Intra-paper targets: %d", len(targets_list))
 
     max_targets = cfg.get("max_targets")
     if max_targets is not None and len(targets_list) > max_targets:
@@ -423,7 +437,9 @@ def main() -> None:
     baseline_cfg_path = Path("configs/baseline.yaml")
     match_threshold = 88.8
     if baseline_cfg_path.exists():
-        match_threshold = yaml.safe_load(baseline_cfg_path.read_text()).get("match_threshold", 88.8)
+        match_threshold = yaml.safe_load(
+            baseline_cfg_path.read_text()
+        ).get("match_threshold", 88.8)
     dep_bodies = load_dep_bodies(table=table, cache_dir=cache_dir)
     matcher = IDMapper(dep_bodies, threshold=match_threshold)
 
@@ -456,20 +472,20 @@ def main() -> None:
 
     optimizer = AdamW(model.parameters(), lr=cfg.get("lr", 1e-6))
 
-    group_size    = cfg.get("group_size", 4)
-    horizon       = cfg.get("horizon", 6)
-    top_k         = cfg.get("top_k", 10)
-    alpha         = cfg.get("alpha", 0.1)
-    beta          = cfg.get("beta", 1.0)
-    temperature   = cfg.get("temperature", 0.7)
+    group_size     = cfg.get("group_size", 4)
+    horizon        = cfg.get("horizon", 6)
+    top_k          = cfg.get("top_k", 10)
+    alpha          = cfg.get("alpha", 0.1)
+    beta           = cfg.get("beta", 1.0)
+    temperature    = cfg.get("temperature", 0.7)
     max_new_tokens = cfg.get("max_completion_length", 128)
-    batch_size    = cfg.get("batch_size", 2)
-    grad_accum    = cfg.get("grad_accum", 4)
-    epochs        = cfg.get("epochs", 3)
-    save_steps    = cfg.get("save_steps", 100)
-    logging_steps = cfg.get("logging_steps", 10)
-    ema_decay     = cfg.get("ema_decay", 0.99)
-    seed          = cfg.get("seed", 42)
+    clip_eps       = cfg.get("clip_eps", 0.2)
+    batch_size     = cfg.get("batch_size", 2)
+    grad_accum     = cfg.get("grad_accum", 4)
+    epochs         = cfg.get("epochs", 3)
+    save_steps     = cfg.get("save_steps", 100)
+    logging_steps  = cfg.get("logging_steps", 10)
+    seed           = cfg.get("seed", 42)
 
     rng = random.Random(seed)
     cache_dir_search = os.path.join(cache_dir, "search")
@@ -477,12 +493,12 @@ def main() -> None:
     log_file = checkpoint_dir / "training_log.jsonl"
     global_step = 0
     accum_count = 0
-    baseline = [0.0]   # mutable EMA baseline (used only when group_size == 1)
     optimizer.zero_grad()
 
     logger.info(
-        "Training on %d targets, %d epochs, group_size=%d, batch_size=%d, grad_accum=%d",
-        len(targets_list), epochs, group_size, batch_size, grad_accum,
+        "GSPO training on %d targets, %d epochs, group_size=%d, batch_size=%d, "
+        "grad_accum=%d, clip_eps=%.2f",
+        len(targets_list), epochs, group_size, batch_size, grad_accum, clip_eps,
     )
 
     for epoch in range(epochs):
@@ -493,10 +509,7 @@ def main() -> None:
         for batch_start in range(0, len(epoch_targets), batch_size):
             batch = epoch_targets[batch_start: batch_start + batch_size]
 
-            # ---- Rollout phase ----
-            # Fresh asyncio.run() per batch: the event loop is torn down before
-            # torch backward runs, so search-timeout callbacks are never delayed
-            # by blocking GPU operations.
+            # ---- Rollout (fresh event loop per batch) ----
             model.eval()
 
             async def _rollout(targets):
@@ -523,11 +536,11 @@ def main() -> None:
             if not episode_groups:
                 continue
 
-            # ---- Update phase (synchronous — no event loop active) ----
+            # ---- GSPO update (synchronous — event loop fully torn down) ----
             torch.cuda.empty_cache()
             model.train()
-            metrics = reinforce_update_step(
-                model, episode_groups, baseline, ema_decay, device,
+            metrics = gspo_update_step(
+                model, episode_groups, device, clip_eps=clip_eps,
             )
             accum_count += 1
 
@@ -541,8 +554,9 @@ def main() -> None:
                 if global_step % logging_steps == 0:
                     log_entry = {"step": global_step, "epoch": epoch + 1, **metrics}
                     logger.info(
-                        "step=%d  loss=%.4f  mean_reward=%.4f  baseline=%.4f",
-                        global_step, metrics["loss"], metrics["mean_reward"], metrics["baseline"],
+                        "step=%d  loss=%.4f  mean_reward=%.4f  degenerate=%d",
+                        global_step, metrics["loss"], metrics["mean_reward"],
+                        metrics.get("degenerate_groups", 0),
                     )
                     with open(log_file, "a") as f:
                         f.write(json.dumps(log_entry) + "\n")
