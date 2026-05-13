@@ -1,4 +1,4 @@
-run_name: reinforce_intra
+run_name: reinforce_v2
 
 # Data
 table: rl_train
@@ -14,25 +14,25 @@ lora_rank: 16
 lora_alpha: 32
 lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
-# REINFORCE hyperparameters — tuned for 97 GB VRAM (RTX PRO 6000 Blackwell)
+# REINFORCE hyperparameters
 group_size: 4        # 4 rollouts per target; within-group advantage normalisation
-temperature: 0.7
+temperature: 1.0     # higher entropy → more diverse rollouts, fewer degenerate groups
 ema_decay: 0.99      # EMA baseline decay (only used when group_size == 1)
-lr: 1.0e-6
+lr: 1.0e-5           # 10× prior; observed strong gradients but minimal weight movement at 1e-6
 batch_size: 2        # 2 targets per rollout batch (8 sequences total)
-grad_accum: 4        # effective targets per optimizer step = 8
-epochs: 3
+grad_accum: 8        # effective targets per optimizer step = 16 (smoother gradient)
+epochs: 5
 max_completion_length: 128
 seed: 42
 
 # MDP
 horizon: 6
 top_k: 10
-alpha: 0.1
+alpha: 0.05          # half prior; 88% drop + mostly-FP signal made 0.1 too punishing of exploration
 beta: 1.0
 
 # Checkpointing / logging
-save_steps: 100
+save_steps: 12   # ~1 checkpoint per epoch (12.5 steps/epoch with effective batch=16)
 logging_steps: 1
 use_wandb: false
 
