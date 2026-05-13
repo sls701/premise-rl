@@ -5,6 +5,9 @@ max_tokens: 512
 concurrency: 4
 use_vllm: false
 
+# Matcher
+corpus_scope: dep_papers  # match training-time scope so TP/FP signal is comparable
+
 # MDP hyperparameters
 horizon: 6
 top_k: 10
@@ -12,5 +15,5 @@ alpha: 0.1
 beta: 1.0
 
 # Paths
-cache_dir: cache/search
+cache_dir: cache
 results_dir: results

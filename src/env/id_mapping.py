@@ -8,7 +8,13 @@ from uuid import UUID
 import diskcache
 import numpy as np
 from rapidfuzz import process as rf_process
-from rapidfuzz.fuzz import partial_ratio
+from rapidfuzz.fuzz import ratio as _scorer  # 150× faster than partial_ratio on
+                                              # 100K+ corpus (1.3s vs 200s+).
+                                              # Both produce 0-100 scores;
+                                              # ratio is stricter (full-string
+                                              # Levenshtein) which suits our case
+                                              # since API bodies should match
+                                              # v2 bodies near-verbatim.
 
 from src.data.load import DepBody
 from src.env.search_client import SearchResult
@@ -21,11 +27,16 @@ logger = logging.getLogger(__name__)
 _CDIST_LOCK = threading.Lock()
 
 
+NORMALIZE_MAX_LEN = 500  # partial_ratio is O(|a|*|b|); cap so cdist over a
+                          # 100K+ corpus stays within ~1s per env.step.
+
 def normalize(body: str) -> str:
     body = re.sub(r"\\label\{[^}]*\}", "", body)
     body = html.unescape(body)
     body = re.sub(r"\s+", " ", body)
     body = body.strip().rstrip(".")
+    if len(body) > NORMALIZE_MAX_LEN:
+        body = body[:NORMALIZE_MAX_LEN]
     return body
 
 
@@ -97,7 +108,7 @@ class IDMapper:
                 scores = rf_process.cdist(
                     queries,
                     self._normalized_bodies,
-                    scorer=partial_ratio,
+                    scorer=_scorer,
                     workers=-1,
                 )
             # Top-2 per row via argpartition (O(M) vs O(M log M) for argsort)

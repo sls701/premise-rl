@@ -424,7 +424,9 @@ def main() -> None:
     match_threshold = 88.8
     if baseline_cfg_path.exists():
         match_threshold = yaml.safe_load(baseline_cfg_path.read_text()).get("match_threshold", 88.8)
-    dep_bodies = load_dep_bodies(table=table, cache_dir=cache_dir)
+    corpus_scope = cfg.get("corpus_scope", "deps_only")
+    dep_bodies = load_dep_bodies(table=table, cache_dir=cache_dir, scope=corpus_scope)
+    logger.info("Loaded %d dep bodies (scope=%s)", len(dep_bodies), corpus_scope)
     matcher = IDMapper(dep_bodies, threshold=match_threshold)
 
     model_id = cfg["model"]

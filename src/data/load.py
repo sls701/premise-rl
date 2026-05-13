@@ -154,24 +154,54 @@ def load_dep_edges(
 def load_dep_bodies(
     table: str = "rl_test_100",
     cache_dir: str | Path = "cache",
+    scope: str = "deps_only",
 ) -> dict[UUID, DepBody]:
+    """Load bodies for the matcher's UUID universe.
+
+    scope:
+      - "deps_only": only statements that ARE a true dep of some target in `table`.
+        ~10K bodies; agent's retrievals mostly drop as uuid=None.
+      - "dep_papers": all statements in papers that contain at least one true dep
+        of some target in `table`. Broader pool so most API retrievals map to a UUID,
+        giving honest TP/FP reward signal instead of silently dropping unrelated hits.
+    """
+    if scope not in {"deps_only", "dep_papers"}:
+        raise ValueError(f"unknown scope: {scope}")
+
     cache_dir = Path(cache_dir)
-    cache = _cache_path(cache_dir, table, "dep_bodies")
+    suffix = "dep_bodies" if scope == "deps_only" else f"dep_bodies_{scope}"
+    cache = _cache_path(cache_dir, table, suffix)
     if cache.exists():
         return _load_pickle(cache)
 
     conn = get_rds_connection("v2")
     try:
         with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT DISTINCT s.statement_id, s.body, s.kind, s.paper_id
-                FROM informal_dependency d
-                JOIN {table} t ON t.src_id = d.src_id
-                JOIN "statement" s ON s.statement_id = d.dep_id
-                WHERE d.cite_key IS NOT NULL
-                  AND 'deterministic' = ANY(d.methods)
-                  AND d.dep_id IS NOT NULL
-            """)
+            if scope == "deps_only":
+                cur.execute(f"""
+                    SELECT DISTINCT s.statement_id, s.body, s.kind, s.paper_id
+                    FROM informal_dependency d
+                    JOIN {table} t ON t.src_id = d.src_id
+                    JOIN "statement" s ON s.statement_id = d.dep_id
+                    WHERE d.cite_key IS NOT NULL
+                      AND 'deterministic' = ANY(d.methods)
+                      AND d.dep_id IS NOT NULL
+                """)
+            else:  # dep_papers
+                cur.execute(f"""
+                    SELECT DISTINCT s.statement_id, s.body, s.kind, s.paper_id
+                    FROM "statement" s
+                    WHERE s.body IS NOT NULL
+                      AND s.paper_id IN (
+                        SELECT DISTINCT s_dep.paper_id
+                        FROM informal_dependency d
+                        JOIN {table} t ON t.src_id = d.src_id
+                        JOIN "statement" s_dep ON s_dep.statement_id = d.dep_id
+                        WHERE d.cite_key IS NOT NULL
+                          AND 'deterministic' = ANY(d.methods)
+                          AND d.dep_id IS NOT NULL
+                      )
+                """)
             rows = cur.fetchall()
     finally:
         conn.close()

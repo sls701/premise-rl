@@ -147,8 +147,10 @@ def main():
     if args.n:
         targets = dict(list(targets.items())[: args.n])
 
-    logger.info("Loading dep bodies for matcher...")
-    dep_bodies = load_dep_bodies(table=table, cache_dir=cache_dir)
+    corpus_scope = config.get("corpus_scope", "deps_only")
+    logger.info("Loading dep bodies for matcher (scope=%s)...", corpus_scope)
+    dep_bodies = load_dep_bodies(table=table, cache_dir=cache_dir, scope=corpus_scope)
+    logger.info("Loaded %d dep bodies", len(dep_bodies))
     matcher = IDMapper(dep_bodies, threshold=match_threshold)
 
     system_prompt = _load_system_prompt()

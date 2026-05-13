@@ -4,6 +4,7 @@ run_name: reinforce_intra
 table: rl_train
 use_intra: false   # reward on true_dep_ids
 max_targets: 200   # subsample for faster convergence
+corpus_scope: dep_papers  # all statements in papers that contain a dep — gives matcher a richer universe so retrievals get honest TP/FP signal
 
 # Model (pin snapshot — never use moving alias)
 model: Qwen/Qwen3-4B
