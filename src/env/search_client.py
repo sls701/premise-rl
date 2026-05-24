@@ -81,7 +81,14 @@ class SearchClient:
         cache_key = (query, k, "v2")
         loop = asyncio.get_running_loop()
 
-        cached = await loop.run_in_executor(None, self._cache.get, cache_key)
+        try:
+            cached = await asyncio.wait_for(
+                loop.run_in_executor(None, self._cache.get, cache_key),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("cache get timed out for query=%r, skipping cache", query[:80])
+            cached = None
         if cached is not None:
             logger.debug("search cache hit  query=%r", query[:120])
             return cached
@@ -106,7 +113,13 @@ class SearchClient:
                         "search ok  t=%.2fs  n=%d  query=%r",
                         elapsed, len(results), query[:120],
                     )
-                    await loop.run_in_executor(None, self._cache.set, cache_key, results)
+                    try:
+                        await asyncio.wait_for(
+                            loop.run_in_executor(None, self._cache.set, cache_key, results),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("cache set timed out for query=%r, skipping", query[:80])
                     return results
                 except Exception as exc:
                     elapsed = _time.monotonic() - _t0

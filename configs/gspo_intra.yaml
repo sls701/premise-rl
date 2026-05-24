@@ -1,4 +1,4 @@
-run_name: gspo_intra
+run_name: gspo_intra_v2
 
 # Data
 table: rl_train
@@ -15,7 +15,7 @@ lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 # GSPO hyperparameters
 group_size: 4        # 4 rollouts per target; within-group advantage normalisation
-temperature: 0.7
+temperature: 1.5
 clip_eps: 0.2        # PPO-style clipping on sequence-level importance ratio
 lr: 1.0e-6
 batch_size: 2        # 2 targets per rollout batch (8 sequences total)
@@ -26,12 +26,12 @@ seed: 42
 
 # MDP
 horizon: 6
-top_k: 10
-alpha: 0.1
+top_k: 20
+alpha: 0.0
 beta: 1.0
 
 # Checkpointing / logging
-save_steps: 100
+save_steps: 10
 logging_steps: 1
 
 # Paths

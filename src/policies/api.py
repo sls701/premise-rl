@@ -64,7 +64,7 @@ class OpenAIAgent:
             model=self.model,
             messages=messages,
             tools=[{"type": "function", "function": SEARCH_TOOL_SCHEMA}],
-            tool_choice="auto",
+            tool_choice="required",
             max_completion_tokens=self.max_tokens,
         )
         if self.temperature is not None:
@@ -130,6 +130,9 @@ class GoogleAgent:
         config = types.GenerateContentConfig(
             system_instruction=system_msg,
             tools=[tool],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="ANY"),
+            ),
             temperature=self.temperature,
             max_output_tokens=self.max_tokens,
         )

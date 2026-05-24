@@ -31,6 +31,7 @@ import concurrent.futures
 import torch
 import torch.nn.functional as F
 import yaml
+from transformers import LogitsProcessor, LogitsProcessorList
 
 # Single-worker executor so model.generate() runs in a thread, leaving the
 # asyncio event loop live to drain search-API responses immediately instead
@@ -45,6 +46,26 @@ logging.basicConfig(
 for _noisy in ("httpcore", "httpx", "asyncio", "urllib3", "filelock", "huggingface_hub"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+class _SafeLogitsProcessor(LogitsProcessor):
+    """Guard against bfloat16 overflow producing all-NaN logit rows.
+
+    InfNanRemoveLogitsProcessor replaces NaN→-inf, which is correct for
+    individual bad values, but when ALL logits in a row are NaN (full bfloat16
+    overflow in some layer) they all become -inf and softmax returns NaN again,
+    triggering the multinomial device-side assertion.  This processor adds one
+    more step: if an entire row is -inf after cleanup, replace with zeros so
+    softmax produces a uniform distribution over the vocabulary.
+    """
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        scores = torch.nan_to_num(scores, nan=float("-inf"), posinf=torch.finfo(scores.dtype).max)
+        all_neg_inf = (scores == float("-inf")).all(dim=-1, keepdim=True)
+        if all_neg_inf.any():
+            logger.warning("logits all -inf for %d token(s); falling back to uniform sampling",
+                           int(all_neg_inf.sum().item()))
+            scores = scores.masked_fill(all_neg_inf.expand_as(scores), 0.0)
+        return scores
 
 
 def load_config(path: str) -> dict:
@@ -186,7 +207,7 @@ async def _run_group_batched(
         tokenizer.padding_side = "left"
         enc = tokenizer(
             prompt_texts, return_tensors="pt", padding=True,
-            truncation=True, max_length=2048,
+            truncation=True, max_length=1536,
         )
         input_ids = enc["input_ids"].to(device)
         attn_mask = enc["attention_mask"].to(device)
@@ -207,6 +228,7 @@ async def _run_group_batched(
                     temperature=temperature,
                     do_sample=True,
                     pad_token_id=tokenizer.eos_token_id,
+                    logits_processor=LogitsProcessorList([_SafeLogitsProcessor()]),
                 )
 
         out = await _loop.run_in_executor(_GENERATE_EXECUTOR, _do_generate)
@@ -371,18 +393,32 @@ def reinforce_update_step(
                     step.prompt_ids + step.completion_ids,
                     dtype=torch.long, device=device,
                 ).unsqueeze(0)
-                seq_attn = torch.ones(1, n_p + n_c, device=device)
 
-                logits = model(seq, attention_mask=seq_attn).logits
+                # attention_mask=None lets SDPA choose flash/mem-efficient backend
+                # (explicit all-ones mask forces the math backend, materialising
+                # the full [1, heads, n, n] attention matrix for all 28 layers).
+                logits = model(seq).logits
+                logit_slice = logits[0, n_p - 1: n_p + n_c - 1].contiguous().float()
+                if logit_slice.isnan().any():
+                    logger.warning("NaN logits in backward (n_p=%d, n_c=%d); skipping", n_p, n_c)
+                    del seq, logits, comp_ids_t, logit_slice
+                    continue
                 comp_ids_t = torch.tensor(step.completion_ids, dtype=torch.long, device=device)
-                log_probs = F.log_softmax(logits[0, n_p - 1: n_p + n_c - 1].contiguous().float(), dim=-1)
+                log_probs = F.log_softmax(logit_slice, dim=-1)
                 token_lp = log_probs[range(n_c), comp_ids_t].mean()
 
                 loss = (-adv * token_lp) / total_steps
                 loss.backward()
                 total_loss_val += loss.item()
 
-                del seq, seq_attn, logits, comp_ids_t, log_probs
+                del seq, logits, comp_ids_t, log_probs
+
+        # Sync + defrag after each group's backward passes.
+        # Sequential backward() calls fragment the CUDA allocator; without
+        # synchronize() the GPU may still be executing kernels when empty_cache()
+        # runs, so in-flight activations appear "live" and aren't reclaimed.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     if degenerate_groups:
         logger.warning("degenerate_groups=%d (all rewards tied — no gradient signal)", degenerate_groups)
@@ -513,6 +549,10 @@ def main() -> None:
             # Fresh asyncio.run() per batch: the event loop is torn down before
             # torch backward runs, so search-timeout callbacks are never delayed
             # by blocking GPU operations.
+            # Defrag before each rollout: varying KV-cache sizes across turns
+            # fragment the pool; left uncleared, this causes illegal-memory-access
+            # errors on batch 7-8 when a new allocation hits a fragmented gap.
+            torch.cuda.empty_cache()
             model.eval()
 
             async def _rollout(targets):
@@ -535,6 +575,9 @@ def main() -> None:
                 logger.error("Rollout failed: %s", exc)
                 continue
 
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.error("Rollout group failed: %s: %s", type(r).__name__, r)
             episode_groups = [g for g in results if not isinstance(g, Exception) and g]
             if not episode_groups:
                 continue
@@ -548,6 +591,16 @@ def main() -> None:
             accum_count += 1
 
             if accum_count >= grad_accum:
+                _nan_g = sum(
+                    1 for p in model.parameters()
+                    if p.requires_grad and p.grad is not None
+                    and not p.grad.isfinite().all()
+                )
+                if _nan_g:
+                    logger.warning("NaN/inf in %d grad tensors; zeroing before step", _nan_g)
+                    for p in model.parameters():
+                        if p.requires_grad and p.grad is not None:
+                            p.grad.nan_to_num_(0.0)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -572,6 +625,16 @@ def main() -> None:
 
         # Flush remaining gradients at epoch end
         if accum_count > 0:
+            _nan_g = sum(
+                1 for p in model.parameters()
+                if p.requires_grad and p.grad is not None
+                and not p.grad.isfinite().all()
+            )
+            if _nan_g:
+                logger.warning("NaN/inf in %d grad tensors (epoch flush); zeroing", _nan_g)
+                for p in model.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        p.grad.nan_to_num_(0.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()

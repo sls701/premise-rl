@@ -1,0 +1,39 @@
+run_name: gspo_debug
+
+# Data — tiny subset for fast crash reproduction
+table: rl_train
+use_intra: false
+max_targets: 2
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GSPO — minimal to trigger update step quickly
+group_size: 2
+temperature: 1.5
+clip_eps: 0.2
+lr: 1.0e-6
+batch_size: 1
+grad_accum: 1
+epochs: 1
+max_completion_length: 64
+
+# MDP — short horizon so turn 2 triggers fast
+horizon: 2
+top_k: 20
+alpha: 0.05
+beta: 1.0
+
+# Logging
+save_steps: 9999
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

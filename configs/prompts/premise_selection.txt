@@ -30,6 +30,4 @@ Anti-patterns:
 
 ## Process
 
-You will be given the target theorem in LaTeX and its natural-language slogan. You may issue up to a configured number of search queries. After each query, you will see the LaTeX and slogans of the top-k results and can decide what to query next. Use the full budget of queries — multiple distinct angles will recover more dependencies than a single well-tuned query.
-
-When you are done searching, emit the string <STOP>.
+You will be given the target theorem in LaTeX and its natural-language slogan. You will be prompted for search queries one at a time. After each query, you will see the LaTeX and slogans of the top-k results and can decide what to query next. Use every query in your budget — multiple distinct angles will recover more dependencies than a single well-tuned query. Your search session ends automatically when the budget is exhausted; do not stop early.

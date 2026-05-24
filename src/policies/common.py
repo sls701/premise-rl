@@ -44,8 +44,8 @@ async def run_episode(
             break
 
         if query is None:
-            logger.debug("agent declined to query, ending episode")
-            break
+            logger.debug("no tool call parsed on turn %d; skipping", _turn)
+            continue
 
         k = k or top_k
         state, reward, done, info = await env.step(query)

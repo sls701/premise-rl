@@ -126,9 +126,10 @@ def main():
 
     table = DATASET_TABLE[args.dataset]
     cache_dir = config.get("cache_dir", "cache")
+    data_cache_dir = config.get("data_cache_dir", "cache")
 
     logger.info("Loading targets from table: %s", table)
-    targets = load_targets(table=table, cache_dir=cache_dir)
+    targets = load_targets(table=table, cache_dir=data_cache_dir)
     if args.n:
         targets = dict(list(targets.items())[: args.n])
 
