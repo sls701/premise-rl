@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from uuid import UUID
 
 from src.env.environment import Trajectory
 
@@ -26,13 +25,8 @@ def compute_metrics(trajectories: list[Trajectory]) -> dict:
     unique_query_rates: list[float] = []
     fp_per_episode: list[float] = []
     terminal_rewards: list[float] = []
-    dropped_no_match_counts: list[int] = []
-    low_confidence_counts: list[int] = []
-    total_results: list[int] = []
 
     by_bucket: dict[str, list[float]] = defaultdict(list)
-    intra_recalls: list[float] = []
-    inter_recalls: list[float] = []
 
     for traj in trajectories:
         true_deps = traj.final_true_dep_ids
@@ -61,24 +55,10 @@ def compute_metrics(trajectories: list[Trajectory]) -> dict:
         )
         terminal_rewards.append(last_terminal)
 
-        dropped = sum(s.dropped_no_match for s in traj.steps)
-        dropped_no_match_counts.append(dropped)
-        n_total = sum(len(s.returned_results) for s in traj.steps)
-        total_results.append(n_total)
-
-        low_conf = sum(s.low_confidence_matches for s in traj.steps)
-        low_confidence_counts.append(low_conf)
-
     n = len(trajectories)
 
     def mean(xs: list) -> float:
         return sum(xs) / max(len(xs), 1)
-
-    dropped_total = sum(dropped_no_match_counts)
-    results_total = sum(total_results)
-    low_conf_total = sum(low_confidence_counts)
-    # matched = results that didn't drop
-    matched_total = results_total - dropped_total
 
     return {
         "n_episodes": n,
@@ -87,8 +67,6 @@ def compute_metrics(trajectories: list[Trajectory]) -> dict:
         "unique_query_rate": mean(unique_query_rates),
         "mean_fp_per_episode": mean(fp_per_episode),
         "mean_terminal_reward": mean(terminal_rewards),
-        "dropped_no_match_rate": dropped_total / max(results_total, 1),
-        "low_confidence_match_rate": low_conf_total / max(matched_total, 1),
         "recall_by_bucket": {k: mean(v) for k, v in by_bucket.items()},
         "recall_by_bucket_counts": {k: len(v) for k, v in by_bucket.items()},
         "total_reward": sum(traj.total_reward for traj in trajectories),

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import Protocol
 
 from src.data.load import Target
 from src.env.environment import PremiseSelectionEnv, Trajectory
@@ -50,30 +50,13 @@ async def run_episode(
         k = k or top_k
         state, reward, done, info = await env.step(query)
 
-        # Build tool result from slogans of the most-recent step's results
-        latest_step = env.get_trajectory().steps[-1]
-        retrieved_this_step = [
-            r for r in latest_step.returned_results if r["mapped_uuid"] is not None
-        ]
-        dropped = latest_step.dropped_no_match
-        slogan_lines = []
-        for r in latest_step.returned_results:
-            # Include slogan if we have it; otherwise note the body was unmatched
-            pass
-
-        # We surface slogans via the state formatter on the next turn
-        # rather than constructing raw tool output here
         tool_output = format_state(state)
-
-        # Append assistant tool call + tool result to history
         messages.append({"role": "assistant", "content": f"[search_theorems] query={query!r} k={k}"})
         messages.append({"role": "user", "content": f"[tool_result]\n{tool_output}"})
 
         if done:
             break
 
-    # If the agent stopped early (before horizon), fire the terminal bonus
-    # without issuing further search queries.
     if not state.done:
         env.finish()
 

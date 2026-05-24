@@ -1,0 +1,36 @@
+{
+  "n_episodes": 100,
+  "recall": 0.18428571428571427,
+  "mean_queries_per_episode": 5.93,
+  "unique_query_rate": 0.995,
+  "mean_fp_per_episode": 48.21,
+  "mean_terminal_reward": 0.18428571428571427,
+  "recall_by_bucket": {
+    "3": 0.15789473684210525,
+    "2": 0.19333333333333333,
+    "4-5": 0.1,
+    "6+": 0.42857142857142855
+  },
+  "recall_by_bucket_counts": {
+    "3": 19,
+    "2": 75,
+    "4-5": 5,
+    "6+": 1
+  },
+  "total_reward": -420.67142857142846,
+  "run_name": "google_gemini-3.1-pro-preview_smoke_20260524T002727Z",
+  "config": {
+    "provider": "google",
+    "model": "gemini-3.1-pro-preview",
+    "temperature": 0.0,
+    "max_tokens": 4096,
+    "concurrency": 8,
+    "horizon": 6,
+    "top_k": 10,
+    "alpha": 0.1,
+    "beta": 1.0,
+    "cache_dir": "cache/search",
+    "results_dir": "results"
+  },
+  "table": "rl_test_100"
+}

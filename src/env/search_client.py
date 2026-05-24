@@ -2,46 +2,42 @@ import asyncio
 import logging
 import time as _time
 from dataclasses import dataclass
+from uuid import UUID
 
 import diskcache
 import httpx
 
 logger = logging.getLogger(__name__)
 
-SEARCH_URL = "https://api.theoremsearch.com/search"
+GRAPH_EMBEDDING_URL = "https://api.theoremsearch.com/graph/embedding"
 
 
 @dataclass
 class SearchResult:
-    theorem_id: int
-    slogan_id: int
+    statement_id: UUID
+    paper_id: UUID
     name: str
     body: str
     slogan: str
-    theorem_type: str
-    link: str
+    source: str      # external_id (arXiv ID, repo slug, etc.)
     similarity: float
-    paper: str
+    score: float
 
 
-def _make_result(item: dict) -> SearchResult:
-    paper = item.get("paper") or {}
-    if isinstance(paper, dict):
-        # API returns paper.source (arXiv ID); paper_id kept as fallback
-        paper_id = paper.get("source", "") or paper.get("paper_id", "")
-    else:
-        paper_id = str(paper)
-    return SearchResult(
-        theorem_id=item.get("theorem_id", 0),
-        slogan_id=item.get("slogan_id", 0),
-        name=item.get("name", ""),
-        body=item.get("body", ""),
-        slogan=item.get("slogan", ""),
-        theorem_type=item.get("theorem_type", ""),
-        link=item.get("link") or "",
-        similarity=item.get("similarity", 0.0),
-        paper=paper_id,
-    )
+def _make_result(item: dict) -> SearchResult | None:
+    try:
+        return SearchResult(
+            statement_id=UUID(item["statement_id"]),
+            paper_id=UUID(item["paper_id"]),
+            name=item.get("name", ""),
+            body=item.get("body", ""),
+            slogan=item.get("slogan", ""),
+            source=item.get("external_id", "") or item.get("source", ""),
+            similarity=item.get("similarity", 0.0),
+            score=item.get("score", 0.0),
+        )
+    except (KeyError, ValueError):
+        return None
 
 
 class SearchClient:
@@ -51,6 +47,9 @@ class SearchClient:
     participates in the event loop's cancellation machinery and is reliable
     even when model.generate() briefly blocks the loop between await points.
     Slow or trickle-response servers are cut off after request_timeout seconds.
+
+    Cache key includes a version suffix ("v2") so stale int-based entries from
+    the old POST /search endpoint are ignored on the first run.
     """
 
     def __init__(
@@ -79,7 +78,7 @@ class SearchClient:
         return self._http
 
     async def search(self, query: str, k: int) -> list[SearchResult]:
-        cache_key = (query, k)
+        cache_key = (query, k, "v2")
         loop = asyncio.get_running_loop()
 
         cached = await loop.run_in_executor(None, self._cache.get, cache_key)
@@ -90,22 +89,18 @@ class SearchClient:
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._concurrency)
 
-        payload = {"query": query, "n_results": k}
+        params = {"query": query, "n_results": k}
 
         async with self._semaphore:
             for attempt in range(3):
                 _t0 = _time.monotonic()
                 try:
                     async with asyncio.timeout(self._request_timeout):
-                        resp = await self._get_http().post(SEARCH_URL, json=payload)
+                        resp = await self._get_http().get(GRAPH_EMBEDDING_URL, params=params)
                     resp.raise_for_status()
                     data = resp.json()
-                    items = (
-                        data.get("theorems")
-                        or data.get("results")
-                        or (data if isinstance(data, list) else [])
-                    )
-                    results = [_make_result(item) for item in items]
+                    items = data.get("results", [])
+                    results = [r for item in items if (r := _make_result(item)) is not None]
                     elapsed = _time.monotonic() - _t0
                     logger.info(
                         "search ok  t=%.2fs  n=%d  query=%r",
@@ -126,7 +121,6 @@ class SearchClient:
                         "search attempt=%d failed (%.2fs): %s  retry in %ds",
                         attempt, elapsed, exc, wait,
                     )
-                    # Recreate client after a failed/cancelled request
                     if self._http and not self._http.is_closed:
                         await self._http.aclose()
                     self._http = None

@@ -90,12 +90,24 @@ class StepRecord:
 class EpisodeRecord:
     target_id: UUID
     total_reward: float
+    recall: float = 0.0
+    n_tps: int = 0
+    n_fps: int = 0
     steps: list[StepRecord] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Query parser
 # ---------------------------------------------------------------------------
+
+def _fill_episode_stats(ep: "EpisodeRecord", env) -> None:
+    traj = env.get_trajectory()
+    ep.total_reward = traj.total_reward
+    n_true = max(len(traj.final_true_dep_ids), 1)
+    ep.recall = len(traj.final_retrieved_uuids & traj.final_true_dep_ids) / n_true
+    ep.n_tps = sum(len(s.new_tps) for s in traj.steps)
+    ep.n_fps = sum(len(s.new_fps) for s in traj.steps)
+
 
 def _parse_query(text: str) -> str | None:
     m = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
@@ -122,7 +134,6 @@ async def _run_group_batched(
     model,
     tokenizer,
     search_client,
-    matcher,
     system_prompt: str,
     group_size: int,
     horizon: int,
@@ -143,7 +154,7 @@ async def _run_group_batched(
 
     envs = [
         PremiseSelectionEnv(
-            search_client=search_client, matcher=matcher,
+            search_client=search_client,
             horizon=horizon, top_k=top_k, alpha=alpha, beta=beta,
         )
         for _ in range(group_size)
@@ -232,7 +243,7 @@ async def _run_group_batched(
             if query is None:
                 if not envs[i]._state.done:
                     envs[i].finish()
-                episodes[i].total_reward = envs[i].get_trajectory().total_reward
+                _fill_episode_stats(episodes[i], envs[i])
             else:
                 episodes[i].steps.append(StepRecord(
                     prompt_ids=prompt_ids_list[j],
@@ -254,7 +265,7 @@ async def _run_group_batched(
                     logger.warning("env.step failed: %s", res)
                     if not envs[i]._state.done:
                         envs[i].finish()
-                    episodes[i].total_reward = envs[i].get_trajectory().total_reward
+                    _fill_episode_stats(episodes[i], envs[i])
                 else:
                     state, _, done, _ = res
                     messages_list[i].append({
@@ -266,7 +277,7 @@ async def _run_group_batched(
                         "content": f"[tool_result]\n{format_state(state)}",
                     })
                     if done:
-                        episodes[i].total_reward = envs[i].get_trajectory().total_reward
+                        _fill_episode_stats(episodes[i], envs[i])
                     else:
                         next_active.append(i)
 
@@ -275,7 +286,7 @@ async def _run_group_batched(
     for i in active:
         if not envs[i]._state.done:
             envs[i].finish()
-        episodes[i].total_reward = envs[i].get_trajectory().total_reward
+        _fill_episode_stats(episodes[i], envs[i])
 
     return episodes
 
@@ -303,23 +314,32 @@ def reinforce_update_step(
     Assumes optimizer.zero_grad() was called before this function.
     Does NOT call optimizer.step().
     """
-    all_rewards = [ep.total_reward for group in episode_groups for ep in group]
+    all_episodes = [ep for group in episode_groups for ep in group]
+    all_rewards = [ep.total_reward for ep in all_episodes]
     if not all_rewards:
         return {"loss": 0.0, "mean_reward": 0.0, "baseline": baseline[0]}
 
+    mean_recall = sum(ep.recall for ep in all_episodes) / len(all_episodes)
+    mean_fp = sum(ep.n_fps for ep in all_episodes) / len(all_episodes)
+    reward_std = float(torch.tensor(all_rewards, dtype=torch.float32).std().item()) if len(all_rewards) > 1 else 0.0
+
     total_steps = sum(
         1
-        for group in episode_groups
-        for ep in group
+        for ep in all_episodes
         for step in ep.steps
         if step.completion_ids
     )
     if total_steps == 0:
-        return {"loss": 0.0, "mean_reward": sum(all_rewards) / len(all_rewards), "baseline": baseline[0]}
+        return {
+            "loss": 0.0, "mean_reward": sum(all_rewards) / len(all_rewards),
+            "mean_recall": mean_recall, "mean_fp": mean_fp, "reward_std": reward_std,
+            "baseline": baseline[0],
+        }
 
     total_loss_val = 0.0
     degenerate_groups = 0
 
+    n_groups = sum(1 for g in episode_groups if g)
     for group in episode_groups:
         if not group:
             continue
@@ -354,7 +374,7 @@ def reinforce_update_step(
 
                 logits = model(seq, attention_mask=seq_attn).logits
                 comp_ids_t = torch.tensor(step.completion_ids, dtype=torch.long, device=device)
-                log_probs = F.log_softmax(logits[0, n_p - 1: n_p + n_c - 1].float(), dim=-1)
+                log_probs = F.log_softmax(logits[0, n_p - 1: n_p + n_c - 1].contiguous().float(), dim=-1)
                 token_lp = log_probs[range(n_c), comp_ids_t].mean()
 
                 loss = (-adv * token_lp) / total_steps
@@ -369,7 +389,11 @@ def reinforce_update_step(
     return {
         "loss": total_loss_val,
         "mean_reward": sum(all_rewards) / len(all_rewards),
+        "mean_recall": mean_recall,
+        "mean_fp": mean_fp,
+        "reward_std": reward_std,
         "baseline": baseline[0],
+        "degenerate_frac": degenerate_groups / max(n_groups, 1),
         "degenerate_groups": degenerate_groups,
     }
 
@@ -394,8 +418,7 @@ def main() -> None:
     from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import LoraConfig, get_peft_model
 
-    from src.data.load import load_targets, load_dep_bodies
-    from src.env.id_mapping import IDMapper
+    from src.data.load import load_targets
     from src.env.search_client import SearchClient
 
     cache_dir = cfg.get("cache_dir", "cache")
@@ -419,15 +442,6 @@ def main() -> None:
         rng_sub = random.Random(cfg.get("seed", 42))
         targets_list = rng_sub.sample(targets_list, max_targets)
         logger.info("Subsampled to %d targets (seed=%d)", len(targets_list), cfg.get("seed", 42))
-
-    baseline_cfg_path = Path("configs/baseline.yaml")
-    match_threshold = 88.8
-    if baseline_cfg_path.exists():
-        match_threshold = yaml.safe_load(baseline_cfg_path.read_text()).get("match_threshold", 88.8)
-    corpus_scope = cfg.get("corpus_scope", "deps_only")
-    dep_bodies = load_dep_bodies(table=table, cache_dir=cache_dir, scope=corpus_scope)
-    logger.info("Loaded %d dep bodies (scope=%s)", len(dep_bodies), corpus_scope)
-    matcher = IDMapper(dep_bodies, threshold=match_threshold)
 
     model_id = cfg["model"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -506,7 +520,7 @@ def main() -> None:
                 try:
                     return await asyncio.gather(*[
                         _run_group_batched(
-                            t, model, tokenizer, sc, matcher,
+                            t, model, tokenizer, sc,
                             system_prompt, group_size, horizon, top_k,
                             alpha, beta, temperature, max_new_tokens, device,
                         )
@@ -543,8 +557,10 @@ def main() -> None:
                 if global_step % logging_steps == 0:
                     log_entry = {"step": global_step, "epoch": epoch + 1, **metrics}
                     logger.info(
-                        "step=%d  loss=%.4f  mean_reward=%.4f  baseline=%.4f",
-                        global_step, metrics["loss"], metrics["mean_reward"], metrics["baseline"],
+                        "step=%d  loss=%.4f  mean_reward=%.4f  recall=%.3f  mean_fp=%.1f  baseline=%.4f  degen=%.2f",
+                        global_step, metrics["loss"], metrics["mean_reward"],
+                        metrics["mean_recall"], metrics["mean_fp"],
+                        metrics["baseline"], metrics["degenerate_frac"],
                     )
                     with open(log_file, "a") as f:
                         f.write(json.dumps(log_entry) + "\n")
@@ -561,6 +577,9 @@ def main() -> None:
             optimizer.zero_grad()
             accum_count = 0
             global_step += 1
+            log_entry = {"step": global_step, "epoch": epoch + 1, **metrics, "epoch_end": True}
+            with open(log_file, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
 
     model.save_pretrained(str(checkpoint_dir / "final"))
     logger.info("Training complete. Final model: %s/final", checkpoint_dir)

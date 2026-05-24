@@ -33,14 +33,6 @@ class DepEdge:
     dep_paper_id: str
 
 
-@dataclass
-class DepBody:
-    statement_id: UUID
-    body: str
-    kind: str
-    paper_id: str
-
-
 def _cache_path(cache_dir: Path, table: str, kind: str) -> Path:
     return cache_dir / f"{table}_{kind}.pkl"
 
@@ -94,7 +86,6 @@ def load_targets(
             post_context=row[8],
         )
 
-    # attach dep edges
     edges = load_dep_edges(table, cache_dir)
     for edge in edges:
         if edge.src_id in targets:
@@ -151,78 +142,8 @@ def load_dep_edges(
     return edges
 
 
-def load_dep_bodies(
-    table: str = "rl_test_100",
-    cache_dir: str | Path = "cache",
-    scope: str = "deps_only",
-) -> dict[UUID, DepBody]:
-    """Load bodies for the matcher's UUID universe.
-
-    scope:
-      - "deps_only": only statements that ARE a true dep of some target in `table`.
-        ~10K bodies; agent's retrievals mostly drop as uuid=None.
-      - "dep_papers": all statements in papers that contain at least one true dep
-        of some target in `table`. Broader pool so most API retrievals map to a UUID,
-        giving honest TP/FP reward signal instead of silently dropping unrelated hits.
-    """
-    if scope not in {"deps_only", "dep_papers"}:
-        raise ValueError(f"unknown scope: {scope}")
-
-    cache_dir = Path(cache_dir)
-    suffix = "dep_bodies" if scope == "deps_only" else f"dep_bodies_{scope}"
-    cache = _cache_path(cache_dir, table, suffix)
-    if cache.exists():
-        return _load_pickle(cache)
-
-    conn = get_rds_connection("v2")
-    try:
-        with conn.cursor() as cur:
-            if scope == "deps_only":
-                cur.execute(f"""
-                    SELECT DISTINCT s.statement_id, s.body, s.kind, s.paper_id
-                    FROM informal_dependency d
-                    JOIN {table} t ON t.src_id = d.src_id
-                    JOIN "statement" s ON s.statement_id = d.dep_id
-                    WHERE d.cite_key IS NOT NULL
-                      AND 'deterministic' = ANY(d.methods)
-                      AND d.dep_id IS NOT NULL
-                """)
-            else:  # dep_papers
-                cur.execute(f"""
-                    SELECT DISTINCT s.statement_id, s.body, s.kind, s.paper_id
-                    FROM "statement" s
-                    WHERE s.body IS NOT NULL
-                      AND s.paper_id IN (
-                        SELECT DISTINCT s_dep.paper_id
-                        FROM informal_dependency d
-                        JOIN {table} t ON t.src_id = d.src_id
-                        JOIN "statement" s_dep ON s_dep.statement_id = d.dep_id
-                        WHERE d.cite_key IS NOT NULL
-                          AND 'deterministic' = ANY(d.methods)
-                          AND d.dep_id IS NOT NULL
-                      )
-                """)
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    bodies = {
-        UUID(str(row[0])): DepBody(
-            statement_id=UUID(str(row[0])),
-            body=row[1] or "",
-            kind=row[2] or "",
-            paper_id=str(row[3]) if row[3] is not None else "",
-        )
-        for row in rows
-    }
-
-    _save_pickle(cache, bodies)
-    return bodies
-
-
 def print_stats(table: str = "rl_test_100", cache_dir: str | Path = "cache") -> None:
     targets = load_targets(table, cache_dir)
-    dep_bodies = load_dep_bodies(table, cache_dir)
 
     true_counts = [len(t.true_dep_ids) for t in targets.values()]
     intra_counts = [len(t.intra_dep_ids) for t in targets.values()]
@@ -252,7 +173,6 @@ def print_stats(table: str = "rl_test_100", cache_dir: str | Path = "cache") -> 
     print(f"  true_dep_ids dist:    {bucket_dist(true_counts)}")
     print(f"  intra_dep_ids dist:   {bucket_dist(intra_counts)}")
     print(f"  unique dep IDs:       {len(all_dep_ids)}")
-    print(f"  dep bodies loaded:    {len(dep_bodies)}")
 
 
 if __name__ == "__main__":

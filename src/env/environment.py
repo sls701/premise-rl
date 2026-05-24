@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from uuid import UUID
 
 from src.data.load import Target
-from src.env.id_mapping import IDMapper, MatchResult
 from src.env.prompts import State
 from src.env.search_client import SearchClient
 from src.train.reward import step_reward, terminal_bonus
@@ -21,8 +19,6 @@ class StepLog:
     returned_results: list[dict]
     new_tps: list[UUID]
     new_fps: list[UUID]
-    dropped_no_match: int
-    low_confidence_matches: int
     step_reward: float
     terminal_reward: float
 
@@ -40,7 +36,6 @@ class PremiseSelectionEnv:
     def __init__(
         self,
         search_client: SearchClient,
-        matcher: IDMapper,
         horizon: int = 6,
         top_k: int = 10,
         alpha: float = 0.1,
@@ -48,7 +43,6 @@ class PremiseSelectionEnv:
         include_context: bool = False,
     ):
         self._client = search_client
-        self._matcher = matcher
         self.horizon = horizon
         self.top_k = top_k
         self.alpha = alpha
@@ -79,40 +73,17 @@ class PremiseSelectionEnv:
 
         results = await self._client.search(query, self.top_k)
 
-        # rapidfuzz.process.cdist() is synchronous C code that blocks the
-        # event loop. Run a single batched call (10 results × ~10K choices)
-        # in the executor so other concurrent step() coroutines can proceed.
-        _loop = asyncio.get_running_loop()
-        _matcher = self._matcher
-        mapped: list[MatchResult] = await _loop.run_in_executor(
-            None, _matcher.map_batch, results
-        )
-
         new_uuids: set[UUID] = set()
-        dropped_no_match = 0
-        low_confidence = 0
         result_logs: list[dict] = []
 
-        for r, m in zip(results, mapped):
-            if m.uuid is None:
-                dropped_no_match += 1
-                result_logs.append({
-                    "int_id": r.theorem_id,
-                    "mapped_uuid": None,
-                    "match_score": m.score,
-                    "second_best_gap": m.second_best_gap,
-                })
-            else:
-                if m.second_best_gap < self._matcher.low_confidence_gap:
-                    low_confidence += 1
-                if m.uuid not in self._state.retrieved_uuids:
-                    new_uuids.add(m.uuid)
-                result_logs.append({
-                    "int_id": r.theorem_id,
-                    "mapped_uuid": str(m.uuid),
-                    "match_score": m.score,
-                    "second_best_gap": m.second_best_gap,
-                })
+        for r in results:
+            uid = r.statement_id
+            if uid not in self._state.retrieved_uuids:
+                new_uuids.add(uid)
+            result_logs.append({
+                "statement_id": str(uid),
+                "similarity": r.similarity,
+            })
 
         true_deps = self._target.true_dep_ids
         new_tps = list(new_uuids & true_deps)
@@ -122,8 +93,8 @@ class PremiseSelectionEnv:
 
         self._state.retrieved_uuids.update(new_uuids)
         self._state.query_history.append(query)
-        for r, m in zip(results, mapped):
-            if m.uuid is not None and r.slogan:
+        for r in results:
+            if r.slogan:
                 self._state.retrieved_slogans.append(
                     (len(self._state.query_history), r.slogan)
                 )
@@ -140,8 +111,6 @@ class PremiseSelectionEnv:
             returned_results=result_logs,
             new_tps=new_tps,
             new_fps=new_fps,
-            dropped_no_match=dropped_no_match,
-            low_confidence_matches=low_confidence,
             step_reward=r_step,
             terminal_reward=r_terminal,
         )
@@ -156,8 +125,6 @@ class PremiseSelectionEnv:
         info = {
             "new_tps": new_tps,
             "new_fps": new_fps,
-            "dropped_no_match": dropped_no_match,
-            "low_confidence_matches": low_confidence,
             "step_reward": r_step,
             "terminal_reward": r_terminal,
         }
@@ -177,15 +144,12 @@ class PremiseSelectionEnv:
         self._trajectory.total_reward += r_terminal
         self._trajectory.final_retrieved_uuids = set(self._state.retrieved_uuids)
         self._state.done = True
-        # Append a synthetic final log entry
         self._trajectory.steps.append(StepLog(
             step=self._state.step_idx + 1,
             query="<STOP>",
             returned_results=[],
             new_tps=[],
             new_fps=[],
-            dropped_no_match=0,
-            low_confidence_matches=0,
             step_reward=0.0,
             terminal_reward=r_terminal,
         ))
