@@ -193,7 +193,7 @@ async def _run_group_batched(
         tokenizer.padding_side = "left"
         enc = tokenizer(
             prompt_texts, return_tensors="pt", padding=True,
-            truncation=True, max_length=3072,
+            truncation=True, max_length=2048,
         )
         input_ids = enc["input_ids"].to(device)
         attn_mask = enc["attention_mask"].to(device)
@@ -230,9 +230,9 @@ async def _run_group_batched(
             completion_ids_list.append(c_ids)
 
         del out, input_ids, attn_mask, enc
-        # empty_cache() must NOT run here while the executor may be running
-        # the next batched generate() — both contend for the CUDA allocator
-        # lock and deadlock. PyTorch handles cache reuse automatically.
+        # Do NOT call empty_cache() here: the executor can start the next generate() immediately
+        # after finishing this one, before asyncio runs this coroutine's continuation.
+        # That races on the CUDA allocator mutex and corrupts GPU state.
 
         completion_texts = [
             tokenizer.decode(c, skip_special_tokens=True)
@@ -496,7 +496,6 @@ def main() -> None:
         logger.info("Resuming LoRA adapters from %s", cfg["resume_from"])
         model.load_adapter(cfg["resume_from"], adapter_name="default", is_trainable=True)
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.print_trainable_parameters()
 
     optimizer = AdamW(model.parameters(), lr=cfg.get("lr", 1e-6))
