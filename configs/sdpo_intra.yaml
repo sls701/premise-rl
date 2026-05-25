@@ -1,0 +1,44 @@
+run_name: sdpo_intra_v1
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# SDPO hyperparameters
+group_size: 4         # G rollouts per target; winner is used for distillation
+temperature: 1.0      # lower than GSPO: diversity less critical, quality more so
+beta_kl: 0.1          # KL penalty weight toward base model (0 = pure SFT on winner)
+use_contrastive: true # DPO-style contrastive loss between winner and loser
+contrastive_beta: 0.1 # DPO temperature (margin scaling)
+min_winner_reward: 0.0 # skip groups whose best rollout has reward <= this
+
+lr: 1.0e-5            # higher than GSPO (1e-6): SFT signal is denser, less noisy
+batch_size: 2
+grad_accum: 4
+epochs: 3
+max_completion_length: 128
+seed: 42
+
+# MDP
+horizon: 6
+top_k: 20
+alpha: 0.0
+beta: 1.0
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints
