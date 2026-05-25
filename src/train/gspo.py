@@ -730,7 +730,7 @@ def main() -> None:
                 global_step += 1
 
                 if global_step % logging_steps == 0:
-                    log_entry = {"step": global_step, "epoch": epoch + 1, **metrics}
+                    log_entry = {"step": global_step, "epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"], **metrics}
                     logger.info(
                         "step=%d  loss=%.4f  mean_reward=%.4f  recall=%.3f  mean_fp=%.1f  degen=%.2f",
                         global_step, metrics["loss"], metrics["mean_reward"],

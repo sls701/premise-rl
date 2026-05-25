@@ -1,0 +1,16 @@
+provider: bedrock
+model: us.anthropic.claude-opus-4-6-v1
+temperature: 1.0
+max_tokens: 4096
+concurrency: 1
+
+# MDP hyperparameters
+horizon: 6
+top_k: 10
+alpha: 0.1
+beta: 1.0
+
+# Paths
+cache_dir: cache/search
+data_cache_dir: cache
+results_dir: results

@@ -113,6 +113,9 @@ def _traj_to_dict(traj: Trajectory) -> dict:
 
 
 def main():
+    from dotenv import load_dotenv
+    load_dotenv()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--policy", choices=["api", "local"], required=True)

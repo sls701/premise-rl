@@ -158,18 +158,79 @@ class GoogleAgent:
 
 
 # ---------------------------------------------------------------------------
+# AWS Bedrock agent (Claude via Converse API)
+# ---------------------------------------------------------------------------
+
+class BedrockAgent:
+    def __init__(self, model: str, temperature: float = 1.0, max_tokens: int = 4096):
+        import boto3
+        region = os.environ.get("AWS_REGION", "us-west-2")
+        self._client = boto3.client("bedrock-runtime", region_name=region)
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+    async def chat(self, messages: list[dict]) -> tuple[str | None, int | None]:
+        import asyncio
+
+        system_blocks = [{"text": m["content"]} for m in messages if m["role"] == "system"]
+        converse_messages = [
+            {"role": m["role"], "content": [{"text": m["content"]}]}
+            for m in messages if m["role"] != "system"
+        ]
+
+        tool_config = {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": "search_theorems",
+                        "description": SEARCH_TOOL_SCHEMA["description"],
+                        "inputSchema": {"json": SEARCH_TOOL_SCHEMA["parameters"]},
+                    }
+                }
+            ],
+            "toolChoice": {"any": {}},  # force a tool call every turn
+        }
+
+        kwargs = dict(
+            modelId=self.model,
+            messages=converse_messages,
+            inferenceConfig={"maxTokens": self.max_tokens, "temperature": self.temperature},
+            toolConfig=tool_config,
+        )
+        if system_blocks:
+            kwargs["system"] = system_blocks
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: self._client.converse(**kwargs)
+        )
+
+        for block in resp["output"]["message"]["content"]:
+            if block.get("toolUse") and block["toolUse"]["name"] == "search_theorems":
+                tool_input = block["toolUse"]["input"]
+                query = tool_input.get("query", "")
+                k = int(tool_input.get("k", 10))
+                return query, k
+
+        return None, None
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def make_agent(config: dict) -> "OpenAIAgent | GoogleAgent":
+def make_agent(config: dict) -> "OpenAIAgent | GoogleAgent | BedrockAgent":
     provider = config.get("provider", "").lower()
     model = config["model"]
-    temperature = config.get("temperature", 0.0)
-    max_tokens = config.get("max_tokens", 1024)
+    temperature = config.get("temperature", 1.0)
+    max_tokens = config.get("max_tokens", 4096)
 
     if provider == "openai":
         return OpenAIAgent(model=model, temperature=temperature, max_tokens=max_tokens)
     elif provider == "google":
         return GoogleAgent(model=model, temperature=temperature, max_tokens=max_tokens)
+    elif provider == "bedrock":
+        return BedrockAgent(model=model, temperature=temperature, max_tokens=max_tokens)
     else:
-        raise ValueError(f"Unknown provider: {provider!r}. Must be 'openai' or 'google'.")
+        raise ValueError(f"Unknown provider: {provider!r}. Must be 'openai', 'google', or 'bedrock'.")

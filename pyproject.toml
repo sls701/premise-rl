@@ -14,7 +14,7 @@ dependencies = [
     # Fuzzy matching
     "rapidfuzz",
     # ML core
-    "torch",
+    "torch==2.11.0+cu128",
     "transformers",
     "peft",
     "accelerate",
@@ -23,6 +23,7 @@ dependencies = [
     # Provider SDKs
     "openai",
     "google-generativeai",
+    "anthropic[bedrock]",
     # Utilities
     "pyyaml",
     "tqdm",
