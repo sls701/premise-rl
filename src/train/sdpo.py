@@ -605,6 +605,7 @@ def main() -> None:
         logger.info("Resuming LoRA adapters from %s", cfg["resume_from"])
         model.load_adapter(cfg["resume_from"], adapter_name="default", is_trainable=True)
     model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
     model.print_trainable_parameters()
 
     optimizer = AdamW(model.parameters(), lr=cfg.get("lr", 1e-5))
@@ -628,11 +629,33 @@ def main() -> None:
     logging_steps    = cfg.get("logging_steps", 1)
     seed             = cfg.get("seed", 42)
 
+    base_lr = cfg.get("lr", 1e-5)
+    lr_scheduler_type = cfg.get("lr_scheduler", None)
+    scheduler = None
+    if lr_scheduler_type == "cosine":
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        batches_per_epoch = max(1, len(targets_list) // batch_size)
+        total_optim_steps = max(1, (batches_per_epoch // grad_accum) * epochs)
+        eta_min = base_lr * cfg.get("lr_min_factor", 0.01)
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_optim_steps, eta_min=eta_min)
+        logger.info(
+            "LR scheduler: cosine  total_steps=%d  lr=%.2e -> eta_min=%.2e",
+            total_optim_steps, base_lr, eta_min,
+        )
+
     rng = random.Random(seed)
     cache_dir_search = os.path.join(cache_dir, "search")
 
     log_file = checkpoint_dir / "training_log.jsonl"
-    global_step = 0
+    # Offset global_step from resume checkpoint so saves never overwrite prior steps.
+    # e.g. resume_from=.../step_20_backup → global_step starts at 20 → next save is step_30.
+    _resume_step = 0
+    if cfg.get("resume_from"):
+        import re as _re
+        _m = _re.search(r"step_(\d+)", str(cfg["resume_from"]))
+        if _m:
+            _resume_step = int(_m.group(1))
+    global_step = _resume_step
     accum_count = 0
     ema_baseline: float | None = None
     optimizer.zero_grad()
@@ -715,6 +738,8 @@ def main() -> None:
                             p.grad.nan_to_num_(0.0)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad()
                 accum_count = 0
                 global_step += 1
@@ -753,6 +778,8 @@ def main() -> None:
                         p.grad.nan_to_num_(0.0)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             optimizer.zero_grad()
             accum_count = 0
             global_step += 1

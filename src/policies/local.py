@@ -4,12 +4,109 @@ Used for the trained policy in Phase 7 eval and during GRPO training rollouts.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class _BatchCoordinator:
+    """Batches concurrent model.generate() calls from multiple async episodes.
+
+    Multiple chat() coroutines submit prompts to an asyncio queue.  A single
+    background task drains the queue in batches: it waits up to `window_s`
+    seconds for more requests to arrive, then runs one model.generate() for
+    all collected prompts together.  This gives ~concurrency-fold throughput
+    improvement over serialised single-prompt generation.
+    """
+
+    def __init__(self, model, tokenizer, temperature: float, max_new_tokens: int,
+                 window_s: float = 0.05):
+        self._model = model
+        self._tokenizer = tokenizer
+        self._temperature = temperature
+        self._max_new_tokens = max_new_tokens
+        self._window_s = window_s
+        self._device = next(model.parameters()).device
+        self._queue: asyncio.Queue | None = None
+        self._task: asyncio.Task | None = None
+
+    def _ensure_started(self) -> None:
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+            self._task = asyncio.create_task(self._run_forever())
+
+    async def generate(self, prompt: str) -> str:
+        self._ensure_started()
+        assert self._queue is not None
+        future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+        await self._queue.put((prompt, future))
+        return await future
+
+    async def _run_forever(self) -> None:
+        assert self._queue is not None
+        while True:
+            first_prompt, first_fut = await self._queue.get()
+            batch: list[tuple[str, asyncio.Future]] = [(first_prompt, first_fut)]
+
+            deadline = asyncio.get_event_loop().time() + self._window_s
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    break
+
+            prompts = [p for p, _ in batch]
+            futures = [f for _, f in batch]
+            logger.info("batch_generate: n=%d", len(prompts))
+
+            loop = asyncio.get_event_loop()
+            try:
+                outputs = await loop.run_in_executor(None, self._generate_batch, prompts)
+                for fut, text in zip(futures, outputs):
+                    if not fut.done():
+                        fut.set_result(text)
+            except Exception as exc:
+                for fut in futures:
+                    if not fut.done():
+                        fut.set_exception(exc)
+
+    def _generate_batch(self, prompts: list[str]) -> list[str]:
+        import torch
+
+        self._tokenizer.padding_side = "left"
+        enc = self._tokenizer(
+            prompts, return_tensors="pt", padding=True,
+            truncation=True, max_length=1536, pad_to_multiple_of=64,
+        )
+        input_ids = enc["input_ids"].to(self._device)
+        attn_mask = enc["attention_mask"].to(self._device)
+        padded_len = input_ids.shape[1]
+
+        do_sample = self._temperature > 0
+        torch.cuda.empty_cache()
+        with torch.no_grad():
+            out = self._model.generate(
+                input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=self._max_new_tokens,
+                temperature=self._temperature if do_sample else None,
+                do_sample=do_sample,
+                pad_token_id=self._tokenizer.eos_token_id,
+            )
+        torch.cuda.synchronize()
+
+        results = []
+        for j in range(len(prompts)):
+            new_ids = out[j, padded_len:]
+            results.append(self._tokenizer.decode(new_ids, skip_special_tokens=True))
+        return results
 
 SEARCH_TOOL = [{
     "type": "function",
@@ -26,6 +123,32 @@ SEARCH_TOOL = [{
         },
     },
 }]
+
+
+def _to_qwen_native(messages: list[dict]) -> list[dict]:
+    """Convert the pipeline's custom [tool_result]/[search_theorems] messages to
+    Qwen's native <tool_call>/<tool_response> format so the model can use its
+    pretrained tool-use behaviour instead of relearning the custom format."""
+    import re
+    result = []
+    for msg in messages:
+        content = msg.get("content", "") or ""
+        if msg["role"] == "user" and content.startswith("[tool_result]\n"):
+            result.append({
+                "role": "tool",
+                "name": "search_theorems",
+                "content": content[len("[tool_result]\n"):],
+            })
+        elif msg["role"] == "assistant" and content.startswith("[search_theorems]"):
+            m = re.search(r"query='([^']*)'", content)
+            query = m.group(1) if m else ""
+            result.append({
+                "role": "assistant",
+                "content": f'<tool_call>\n{json.dumps({"name": "search_theorems", "arguments": {"query": query}})}\n</tool_call>',
+            })
+        else:
+            result.append(msg)
+    return result
 
 
 class LocalAgent:
@@ -45,6 +168,7 @@ class LocalAgent:
         self._model = None
         self._tokenizer = None
         self._vllm_client = None
+        self._coordinator: _BatchCoordinator | None = None
 
     def _load(self) -> None:
         if self._model is not None:
@@ -71,6 +195,9 @@ class LocalAgent:
             logger.info("Loading LoRA from %s", self.checkpoint_dir)
             self._model = PeftModel.from_pretrained(self._model, str(self.checkpoint_dir))
         self._model.eval()
+        self._coordinator = _BatchCoordinator(
+            self._model, self._tokenizer, self.temperature, self.max_new_tokens,
+        )
 
     def _load_vllm(self) -> None:
         from vllm import LLM, SamplingParams
@@ -80,22 +207,22 @@ class LocalAgent:
     def _build_prompt(self, messages: list[dict]) -> str:
         assert self._tokenizer is not None
         return self._tokenizer.apply_chat_template(
-            messages, tools=SEARCH_TOOL, tokenize=False,
+            _to_qwen_native(messages), tools=SEARCH_TOOL, tokenize=False,
             add_generation_prompt=True, enable_thinking=False,
         )
 
     async def chat(self, messages: list[dict]) -> tuple[str | None, int | None]:
-        import asyncio
         self._load()
 
         if self.use_vllm:
             return await asyncio.get_event_loop().run_in_executor(
                 None, self._chat_vllm, messages
             )
-        else:
-            return await asyncio.get_event_loop().run_in_executor(
-                None, self._chat_transformers, messages
-            )
+
+        assert self._coordinator is not None
+        prompt = self._build_prompt(messages)
+        text = await self._coordinator.generate(prompt)
+        return self._parse_tool_call(text)
 
     def _chat_transformers(self, messages: list[dict]) -> tuple[str | None, int | None]:
         import torch

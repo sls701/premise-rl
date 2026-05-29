@@ -27,6 +27,11 @@ Launch:
 from __future__ import annotations
 
 import os
+# Must be set before any CUDA context is created. Serializes all GPU kernel
+# launches so async errors surface at the correct call site rather than being
+# deferred to an unrelated CUDA op (prevents misaligned-address / illegal-
+# instruction crashes that corrupt the CUDA context on L40S / Ada Lovelace).
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import argparse
 import asyncio
@@ -123,17 +128,13 @@ class EpisodeRecord:
 # Query parser
 # ---------------------------------------------------------------------------
 
-def _fill_episode_stats(ep: "EpisodeRecord", env, tp_bonus: float = 0.0) -> None:
+def _fill_episode_stats(ep: "EpisodeRecord", env) -> None:
     traj = env.get_trajectory()
     ep.total_reward = traj.total_reward
     n_true = max(len(traj.final_true_dep_ids), 1)
     ep.recall = len(traj.final_retrieved_uuids & traj.final_true_dep_ids) / n_true
     ep.n_tps = sum(len(s.new_tps) for s in traj.steps)
     ep.n_fps = sum(len(s.new_fps) for s in traj.steps)
-    # Bonus per discovered TP: rewards incremental progress within each turn,
-    # creating advantage signal even in low-recall groups where base reward is tiny.
-    if tp_bonus > 0.0 and ep.n_tps > 0:
-        ep.total_reward += tp_bonus * ep.n_tps
 
 
 def _parse_query(text: str) -> str | None:
@@ -170,7 +171,6 @@ async def _run_group_batched(
     temperature: float,
     max_new_tokens: int,
     device,
-    tp_bonus: float = 0.0,
 ) -> list[EpisodeRecord]:
     from src.env.environment import PremiseSelectionEnv
     from src.env.prompts import format_state
@@ -211,7 +211,6 @@ async def _run_group_batched(
         enc = tokenizer(
             prompt_texts, return_tensors="pt", padding=True,
             truncation=True, max_length=1536,
-            pad_to_multiple_of=64,
         )
         input_ids = enc["input_ids"].to(device)
         attn_mask = enc["attention_mask"].to(device)
@@ -220,12 +219,6 @@ async def _run_group_batched(
                     _turn, len(active), list(input_ids.shape), _time.monotonic() - _t0)
 
         _tg = _time.monotonic()
-        # Flush PyTorch's CUDA allocator cache before each generate so the
-        # allocator starts defragmented.  Without this, longer turn-0 prompts
-        # leave fragmented allocations that prevent the cuBLAS workspace from
-        # being satisfied at turn 1 (1536-token sequences), causing
-        # CUBLAS_STATUS_INTERNAL_ERROR on L40S.
-        torch.cuda.empty_cache()
         with torch.no_grad():
             out = model.generate(
                 input_ids,
@@ -235,7 +228,6 @@ async def _run_group_batched(
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
                 logits_processor=LogitsProcessorList([_SafeLogitsProcessor()]),
-                use_cache=True,
             )
         # Synchronize so async CUDA errors from generate() surface immediately,
         # not deferred to the next CUDA operation in the update step.
@@ -268,8 +260,9 @@ async def _run_group_batched(
         for j, i in enumerate(active):
             query = _parse_query(completion_texts[j])
             if query is None:
-                # No valid tool call this turn — keep episode alive for next turn
-                next_active.append(i)
+                if not envs[i]._state.done:
+                    envs[i].finish()
+                _fill_episode_stats(episodes[i], envs[i])
             else:
                 episodes[i].steps.append(StepRecord(
                     prompt_ids=prompt_ids_list[j],
@@ -291,20 +284,19 @@ async def _run_group_batched(
                     logger.warning("env.step failed: %s", res)
                     if not envs[i]._state.done:
                         envs[i].finish()
-                    _fill_episode_stats(episodes[i], envs[i], tp_bonus=tp_bonus)
+                    _fill_episode_stats(episodes[i], envs[i])
                 else:
                     state, _, done, _ = res
                     messages_list[i].append({
                         "role": "assistant",
-                        "content": f'<tool_call>\n{json.dumps({"name": "search_theorems", "arguments": {"query": query}})}\n</tool_call>',
+                        "content": f"[search_theorems] query={query!r}",
                     })
                     messages_list[i].append({
-                        "role": "tool",
-                        "name": "search_theorems",
-                        "content": format_state(state),
+                        "role": "user",
+                        "content": f"[tool_result]\n{format_state(state)}",
                     })
                     if done:
-                        _fill_episode_stats(episodes[i], envs[i], tp_bonus=tp_bonus)
+                        _fill_episode_stats(episodes[i], envs[i])
                     else:
                         next_active.append(i)
 
@@ -385,32 +377,22 @@ def gspo_update_step(
 
         rewards = [ep.total_reward for ep in group]
         rewards_t = torch.tensor(rewards, dtype=torch.float32)
-        mean_r = rewards_t.mean().item()
         std_r = rewards_t.std().item()
-
         if std_r < 1e-8:
-            # Degenerate group: all rewards identical. EMA tracks the baseline
-            # regardless, but we only apply gradient when reward exceeds baseline.
-            # Negative group_adv (reward < EMA) means the group uniformly failed;
-            # since all rollouts failed equally we have no direction signal, so
-            # penalising the whole trajectory just degrades the policy.
             degenerate_groups += 1
-            if ema_baseline is None:
-                ema_baseline = mean_r  # initialise baseline, skip (no reference yet)
-                continue
-            group_adv = mean_r - ema_baseline
-            ema_baseline = ema_decay * ema_baseline + (1 - ema_decay) * mean_r
-            if group_adv <= 1e-6:
-                continue  # zero or negative advantage — no useful direction signal
-            advantages = [group_adv for _ in rewards]
-        else:
-            # Non-degenerate group: within-group normalised GSPO advantage.
-            if ema_baseline is None:
-                ema_baseline = mean_r
-            else:
-                ema_baseline = ema_decay * ema_baseline + (1 - ema_decay) * mean_r
-            advantages = [(r - mean_r) / (std_r + 1e-8) for r in rewards]
+            continue
+        mean_r = rewards_t.mean().item()
 
+        # Update EMA with this non-degenerate group's mean reward
+        if ema_baseline is None:
+            ema_baseline = mean_r
+        else:
+            ema_baseline = ema_decay * ema_baseline + (1 - ema_decay) * mean_r
+
+        advantages = [(r - mean_r) / (std_r + 1e-8) for r in rewards]
+
+        # Synchronize before the group's forward passes to catch any deferred
+        # CUDA errors from the rollout or previous degenerate groups.
         torch.cuda.synchronize()
 
         for ep_idx, ep in enumerate(group):
@@ -423,75 +405,47 @@ def gspo_update_step(
                 n_p = len(step.prompt_ids)
                 n_c = len(step.completion_ids)
 
-                # Priority 6: no manual 8-align padding — just prompt + completion.
-                _ids = step.prompt_ids + step.completion_ids
-                seq = torch.tensor(_ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, n_p+n_c]
+                # Pad to multiple of 8: cuBLAS bf16 Tensor Core GEMMs require the
+                # K-dimension (sequence length) to be 8-aligned.  Padding with zeros
+                # is safe: causal attention prevents padded positions from receiving
+                # gradient from the real loss positions, so they contribute nothing.
+                _n_raw = n_p + n_c
+                _pad8 = (-_n_raw) % 8
+                _ids = step.prompt_ids + step.completion_ids + [0] * _pad8
+                seq = torch.tensor(
+                    _ids, dtype=torch.long, device=device,
+                ).unsqueeze(0)                                      # [1, n_p+n_c+pad]
                 comp_ids_t = torch.tensor(
                     step.completion_ids, dtype=torch.long, device=device,
-                )  # [n_c]
+                )                                                   # [n_c]
 
                 # ---- Current policy (with grad) ----
-                logits = model(seq, use_cache=False).logits  # [1, seq_len, V]
+                # attention_mask=None → SDPA selects flash/mem-efficient backend
+                # (explicit all-ones mask forces math backend → O(n²) materialization)
+                logits = model(seq).logits                          # [1, seq_len, V]
                 logit_slice = logits[0, n_p - 1: n_p + n_c - 1].contiguous().float()
-                if logit_slice.shape[0] != n_c:
-                    logger.error(
-                        "Bad current-policy slice: n_p=%d n_c=%d slice_shape=%s seq_len=%d",
-                        n_p, n_c, tuple(logit_slice.shape), seq.shape[1],
-                    )
+                if logit_slice.isnan().any():
+                    # NaN in activations → NaN gradients → corrupt LoRA weights.
+                    # Skip this step rather than propagating poison.
+                    logger.warning("NaN logits in backward (n_p=%d, n_c=%d); skipping", n_p, n_c)
                     del seq, logits, comp_ids_t, logit_slice
                     continue
-                if not torch.isfinite(logit_slice).all():
-                    logger.warning("Non-finite current logits (n_p=%d, n_c=%d); skipping", n_p, n_c)
-                    del seq, logits, comp_ids_t, logit_slice
-                    continue
-                vocab_size = logit_slice.shape[-1]
-                if comp_ids_t.min() < 0 or comp_ids_t.max() >= vocab_size:
-                    logger.error(
-                        "Completion token out of range for current policy: min=%d max=%d vocab_size=%d n_c=%d",
-                        int(comp_ids_t.min()), int(comp_ids_t.max()), vocab_size, n_c,
-                    )
-                    del seq, logits, comp_ids_t, logit_slice
-                    continue
-                cur_lp = F.log_softmax(logit_slice, dim=-1)  # [n_c, V]
-                cur_token_lp = cur_lp.gather(1, comp_ids_t.view(-1, 1)).squeeze(1)  # [n_c]
+                cur_lp = F.log_softmax(logit_slice, dim=-1)         # [n_c, V]
+                cur_token_lp = cur_lp[range(n_c), comp_ids_t]      # [n_c]
 
                 # ---- Reference policy (base model, no grad) ----
                 with model.disable_adapter(), torch.no_grad():
-                    ref_logits = model(seq, use_cache=False).logits
-                ref_logit_slice = ref_logits[0, n_p - 1: n_p + n_c - 1].contiguous().float()
-                if ref_logit_slice.shape[0] != n_c:
-                    logger.error(
-                        "Bad reference-policy slice: n_p=%d n_c=%d slice_shape=%s seq_len=%d",
-                        n_p, n_c, tuple(ref_logit_slice.shape), seq.shape[1],
-                    )
-                    del seq, logits, ref_logits, comp_ids_t, logit_slice, cur_lp, cur_token_lp, ref_logit_slice
-                    continue
-                if not torch.isfinite(ref_logit_slice).all():
-                    logger.warning("Non-finite reference logits (n_p=%d, n_c=%d); skipping", n_p, n_c)
-                    del seq, logits, ref_logits, comp_ids_t, logit_slice, cur_lp, cur_token_lp, ref_logit_slice
-                    continue
-                ref_vocab_size = ref_logit_slice.shape[-1]
-                if comp_ids_t.min() < 0 or comp_ids_t.max() >= ref_vocab_size:
-                    logger.error(
-                        "Completion token out of range for reference policy: min=%d max=%d vocab_size=%d n_c=%d",
-                        int(comp_ids_t.min()), int(comp_ids_t.max()), ref_vocab_size, n_c,
-                    )
-                    del seq, logits, ref_logits, comp_ids_t, logit_slice, cur_lp, cur_token_lp, ref_logit_slice
-                    continue
-                ref_lp = F.log_softmax(ref_logit_slice, dim=-1)
-                ref_token_lp = ref_lp.gather(1, comp_ids_t.view(-1, 1)).squeeze(1)  # [n_c]
-
-                if not torch.isfinite(cur_token_lp).all() or not torch.isfinite(ref_token_lp).all():
-                    logger.warning("Non-finite token logprobs; skipping step (n_p=%d, n_c=%d)", n_p, n_c)
-                    del seq, logits, ref_logits, comp_ids_t, logit_slice, cur_lp, ref_lp
-                    del cur_token_lp, ref_token_lp, ref_logit_slice
-                    continue
+                    ref_logits = model(seq).logits
+                ref_lp = F.log_softmax(
+                    ref_logits[0, n_p - 1: n_p + n_c - 1].contiguous().float(), dim=-1
+                )
+                ref_token_lp = ref_lp[range(n_c), comp_ids_t]      # [n_c]
 
                 # ---- Length-normalised sequence importance ratio ----
                 # s_i = exp( mean_t[ log π_θ(t) - log π_old(t) ] )
                 mean_log_ratio = (cur_token_lp - ref_token_lp.detach()).mean()
                 mean_log_ratio = mean_log_ratio.clamp(-10.0, 10.0)  # numerical guard
-                s_i = mean_log_ratio.exp()  # scalar, has grad
+                s_i = mean_log_ratio.exp()                           # scalar, has grad
 
                 # ---- Clipped surrogate (PPO-style) ----
                 s_i_clipped = s_i.clamp(1.0 - clip_eps, 1.0 + clip_eps)
@@ -499,17 +453,11 @@ def gspo_update_step(
                 surr2 = s_i_clipped * adv
                 step_loss = -torch.min(surr1, surr2) / total_steps
 
-                if not torch.isfinite(step_loss):
-                    logger.warning("Non-finite step loss; skipping backward (n_p=%d, n_c=%d)", n_p, n_c)
-                    del seq, logits, ref_logits, comp_ids_t
-                    del cur_lp, ref_lp, cur_token_lp, ref_token_lp, ref_logit_slice
-                    continue
-
                 step_loss.backward()
                 total_loss_val += step_loss.item()
 
                 del seq, logits, ref_logits, comp_ids_t
-                del cur_lp, ref_lp, cur_token_lp, ref_token_lp, ref_logit_slice
+                del cur_lp, ref_lp, cur_token_lp, ref_token_lp
 
         # Sync + defrag after each group's backward passes.
         # Sequential backward() calls fragment the CUDA allocator; without
@@ -580,28 +528,16 @@ def main() -> None:
     model_id = cfg["model"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Loading model %s on %s...", model_id, device)
+    # Force float32 accumulation for bf16 GEMMs so cuBLAS never selects the
+    # Tensor Core path that requires K-dimension to be a multiple of 8.
+    # This prevents CUBLAS_STATUS_EXECUTION_FAILED on L40S / Ada Lovelace GPUs.
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype=torch.bfloat16, device_map="cuda:0",
         attn_implementation="sdpa",
     )
-
-    # Priority 3: log vocab compatibility and assert invariants.
-    logger.info(
-        "tokenizer_len=%d model_vocab=%d eos_token_id=%s pad_token_id=%s",
-        len(tokenizer), model.config.vocab_size,
-        tokenizer.eos_token_id, tokenizer.pad_token_id,
-    )
-    assert tokenizer.eos_token_id is not None, "tokenizer.eos_token_id must be set"
-    assert tokenizer.eos_token_id < model.config.vocab_size, "eos_token_id exceeds model vocab"
-    if len(tokenizer) > model.config.vocab_size:
-        logger.warning(
-            "Tokenizer has more tokens than model vocab (%d > %d); resizing embeddings.",
-            len(tokenizer), model.config.vocab_size,
-        )
-        model.resize_token_embeddings(len(tokenizer))
-
     lora_cfg = LoraConfig(
         r=cfg.get("lora_rank", 16),
         lora_alpha=cfg.get("lora_alpha", 32),
@@ -614,9 +550,6 @@ def main() -> None:
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
-    # Priority 4: disable KV cache during training forwards to avoid memory
-    # pressure and interaction with attention backends.
-    model.config.use_cache = False
     if cfg.get("resume_from"):
         logger.info("Resuming LoRA adapters from %s", cfg["resume_from"])
         model.load_adapter(cfg["resume_from"], adapter_name="default", is_trainable=True)
@@ -631,8 +564,6 @@ def main() -> None:
     alpha          = cfg.get("alpha", 0.1)
     beta           = cfg.get("beta", 1.0)
     temperature    = cfg.get("temperature", 0.7)
-    temperature_final = cfg.get("temperature_final", temperature)
-    tp_bonus       = cfg.get("tp_bonus", 0.0)
     max_new_tokens = cfg.get("max_completion_length", 128)
     clip_eps       = cfg.get("clip_eps", 0.2)
     ema_decay      = cfg.get("ema_decay", 0.95)
@@ -649,24 +580,18 @@ def main() -> None:
     log_file = checkpoint_dir / "training_log.jsonl"
     global_step = 0
     accum_count = 0
-    accum_has_signal = False   # True if any backward() fired in this accum window
     ema_baseline: float | None = None
     optimizer.zero_grad()
 
-    # Total steps for temperature annealing schedule
-    total_training_steps = max(epochs * (len(targets_list) // max(batch_size, 1)), 1)
-
     logger.info(
         "GSPO training on %d targets, %d epochs, group_size=%d, batch_size=%d, "
-        "grad_accum=%d, clip_eps=%.2f, temperature=%.2f→%.2f, top_k=%d, tp_bonus=%.2f",
+        "grad_accum=%d, clip_eps=%.2f",
         len(targets_list), epochs, group_size, batch_size, grad_accum, clip_eps,
-        temperature, temperature_final, top_k, tp_bonus,
     )
 
     for epoch in range(epochs):
-        # Shuffle for diverse reward signal; targets with many true deps are more
-        # likely to yield non-zero recall, so avoid front-loading few-dep targets.
-        epoch_targets = sorted(targets_list, key=lambda t: rng.random())
+        epoch_targets = list(targets_list)
+        rng.shuffle(epoch_targets)
         logger.info("=== Epoch %d/%d (%d targets) ===", epoch + 1, epochs, len(epoch_targets))
 
         for batch_start in range(0, len(epoch_targets), batch_size):
@@ -678,48 +603,37 @@ def main() -> None:
             torch.cuda.empty_cache()
             model.eval()
 
-            # Temperature annealing: linear decay from temperature → temperature_final
-            frac = min(global_step / total_training_steps, 1.0)
-            current_temperature = temperature + frac * (temperature_final - temperature)
-
-            async def _rollout(targets, _temp=current_temperature, _tp_bonus=tp_bonus):
+            async def _rollout(targets):
                 sc = SearchClient(cache_dir=cache_dir_search)
                 try:
-                    # Priority 1: no return_exceptions — CUDA failures propagate
-                    # immediately so the CUDA context stays clean.
                     return await asyncio.gather(*[
                         _run_group_batched(
                             t, model, tokenizer, sc,
                             system_prompt, group_size, horizon, top_k,
-                            alpha, beta, _temp, max_new_tokens, device,
-                            tp_bonus=_tp_bonus,
+                            alpha, beta, temperature, max_new_tokens, device,
                         )
                         for t in targets
-                    ])
+                    ], return_exceptions=True)
                 finally:
                     await sc.close()
 
             try:
                 results = asyncio.run(_rollout(batch))
-            except RuntimeError as exc:
-                logger.exception("Rollout failed")
-                # Priority 8: re-raise CUDA errors immediately — don't call
-                # further CUDA ops on a poisoned context.
-                if "CUDA" in str(exc) or "cuda" in str(exc):
-                    raise
-                torch.cuda.empty_cache()
-                continue
-            except Exception:
-                logger.exception("Rollout failed")
+            except Exception as exc:
+                logger.error("Rollout failed: %s", exc)
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
                 continue
 
-            episode_groups = [g for g in results if g]
+            episode_groups = [g for g in results if not isinstance(g, Exception) and g]
             if not episode_groups:
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
                 continue
 
             # ---- GSPO update (synchronous — event loop fully torn down) ----
+            # Synchronize before empty_cache so any async CUDA errors from the
+            # rollout surface here rather than inside the update step's forward pass.
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             model.train()
@@ -728,39 +642,35 @@ def main() -> None:
                 ema_baseline=ema_baseline, ema_decay=ema_decay,
             )
             ema_baseline = metrics.get("ema_baseline", ema_baseline)
-            if metrics["loss"] != 0.0:
-                accum_has_signal = True
             accum_count += 1
 
             if accum_count >= grad_accum:
-                if accum_has_signal:
-                    # Zero any NaN/inf gradients before clipping — NaN grads from
-                    # flash-SDP numerical instability propagate through clip_grad_norm_
-                    # and corrupt LoRA weights permanently.
-                    _nan_g = sum(
-                        1 for p in model.parameters()
-                        if p.requires_grad and p.grad is not None
-                        and not p.grad.isfinite().all()
-                    )
-                    if _nan_g:
-                        logger.warning("NaN/inf in %d grad tensors; zeroing before step", _nan_g)
-                        for p in model.parameters():
-                            if p.requires_grad and p.grad is not None:
-                                p.grad.nan_to_num_(0.0)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                # Zero any NaN/inf gradients before clipping — NaN grads from
+                # flash-SDP numerical instability propagate through clip_grad_norm_
+                # and corrupt LoRA weights permanently.
+                _nan_g = sum(
+                    1 for p in model.parameters()
+                    if p.requires_grad and p.grad is not None
+                    and not p.grad.isfinite().all()
+                )
+                if _nan_g:
+                    logger.warning("NaN/inf in %d grad tensors; zeroing before step", _nan_g)
+                    for p in model.parameters():
+                        if p.requires_grad and p.grad is not None:
+                            p.grad.nan_to_num_(0.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
                 optimizer.zero_grad()
-                accum_has_signal = False
                 accum_count = 0
                 global_step += 1
 
                 if global_step % logging_steps == 0:
-                    log_entry = {"step": global_step, "epoch": epoch + 1, "lr": optimizer.param_groups[0]["lr"], "temperature": current_temperature, **metrics}
+                    log_entry = {"step": global_step, "epoch": epoch + 1, **metrics}
                     logger.info(
-                        "step=%d  loss=%.4f  mean_reward=%.4f  recall=%.3f  mean_fp=%.1f  degen=%.2f  temp=%.3f",
+                        "step=%d  loss=%.4f  mean_reward=%.4f  recall=%.3f  mean_fp=%.1f  degen=%.2f",
                         global_step, metrics["loss"], metrics["mean_reward"],
                         metrics["mean_recall"], metrics["mean_fp"],
-                        metrics["degenerate_frac"], current_temperature,
+                        metrics["degenerate_frac"],
                     )
                     with open(log_file, "a") as f:
                         f.write(json.dumps(log_entry) + "\n")
@@ -772,21 +682,19 @@ def main() -> None:
 
         # Flush remaining gradients at epoch end
         if accum_count > 0:
-            if accum_has_signal:
-                _nan_g = sum(
-                    1 for p in model.parameters()
-                    if p.requires_grad and p.grad is not None
-                    and not p.grad.isfinite().all()
-                )
-                if _nan_g:
-                    logger.warning("NaN/inf in %d grad tensors (epoch flush); zeroing", _nan_g)
-                    for p in model.parameters():
-                        if p.requires_grad and p.grad is not None:
-                            p.grad.nan_to_num_(0.0)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+            _nan_g = sum(
+                1 for p in model.parameters()
+                if p.requires_grad and p.grad is not None
+                and not p.grad.isfinite().all()
+            )
+            if _nan_g:
+                logger.warning("NaN/inf in %d grad tensors (epoch flush); zeroing", _nan_g)
+                for p in model.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        p.grad.nan_to_num_(0.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             optimizer.zero_grad()
-            accum_has_signal = False
             accum_count = 0
             global_step += 1
             log_entry = {"step": global_step, "epoch": epoch + 1, **metrics, "epoch_end": True}

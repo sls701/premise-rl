@@ -1,0 +1,46 @@
+run_name: gspo_intra_v7
+
+# Resume from v4/step_15 (best known: 7.1% val recall)
+resume_from: checkpoints/gspo_intra_v4/step_15
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+seed: 44
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GSPO hyperparameters — match v4 exploration settings that reached 7.1%
+group_size: 4
+temperature: 1.5
+temperature_final: 0.5
+clip_eps: 0.2
+lr: 4.0e-7
+batch_size: 2
+grad_accum: 4
+epochs: 2
+max_completion_length: 128
+
+# MDP
+horizon: 6
+top_k: 40
+alpha: 0.0
+beta: 1.0
+tp_bonus: 0.05
+ema_decay: 0.99
+
+# Checkpointing / logging
+save_steps: 5
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

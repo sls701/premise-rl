@@ -1,0 +1,45 @@
+run_name: gspo_intra_v4
+
+# Warm-start from v3 step_5 (best available); apply all pipeline improvements
+resume_from: checkpoints/gspo_intra_v4/step_5
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GSPO hyperparameters
+group_size: 4
+temperature: 1.5
+temperature_final: 0.5   # anneal toward greedy to close train/eval gap
+clip_eps: 0.2
+lr: 5.0e-7
+batch_size: 2
+grad_accum: 4
+epochs: 2
+max_completion_length: 128
+seed: 44                 # fresh seed for curriculum ordering
+
+# MDP
+horizon: 6
+top_k: 40                # 2x wider search net → lower degen, more TP coverage
+alpha: 0.0
+beta: 1.0
+tp_bonus: 0.05           # per-TP reward bonus to sharpen advantage signal
+
+# Checkpointing / logging
+save_steps: 5
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

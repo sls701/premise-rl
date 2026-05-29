@@ -1,0 +1,47 @@
+run_name: sdpo_intra_v2
+
+# Continue from best known checkpoint (9.625% val recall at step_40)
+resume_from: checkpoints/sdpo_intra_v1/step_40
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# SDPO hyperparameters — same as v1 which reached 9.625%
+group_size: 4
+temperature: 1.5      # raised: well-trained model needs more diversity to avoid degenerate groups
+beta_kl: 0.1
+use_contrastive: true
+contrastive_beta: 0.1
+min_winner_reward: 0.0
+
+lr: 5.0e-6            # slightly lower than v1 (1e-5) to fine-tune rather than reset
+batch_size: 2
+grad_accum: 4
+epochs: 3
+max_completion_length: 128
+seed: 55              # fresh seed for different target ordering
+
+# MDP
+horizon: 6
+top_k: 30
+alpha: 0.0
+beta: 1.0
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

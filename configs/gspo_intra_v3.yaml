@@ -1,0 +1,44 @@
+run_name: gspo_intra_v3
+
+# Warm-start from best GSPO checkpoint; 2 short epochs at lower LR
+# to consolidate without the degradation seen in GSPO v2 epochs 2-3.
+resume_from: checkpoints/gspo_intra_v2/step_10
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GSPO hyperparameters
+group_size: 4
+temperature: 1.5
+clip_eps: 0.2
+lr: 5.0e-7           # half of v2 lr to avoid the epoch-2 degradation
+batch_size: 2
+grad_accum: 4
+epochs: 2            # short: stop before overfitting
+max_completion_length: 128
+seed: 43             # different seed for target/epoch shuffling
+
+# MDP
+horizon: 6
+top_k: 20
+alpha: 0.0
+beta: 1.0
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

@@ -1,0 +1,49 @@
+run_name: sdpo_intra_v3
+
+# Resume from best confirmed checkpoint (10.0% val recall, 50-ep)
+resume_from: checkpoints/sdpo_intra_v3/step_20_backup
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# SDPO hyperparameters — gentle fine-tuning of already-trained model
+group_size: 4
+temperature: 1.0      # keep same as v1; high temp hurt with well-trained model
+beta_kl: 0.1
+use_contrastive: true
+contrastive_beta: 0.1
+min_winner_reward: 0.0
+
+lr: 1.0e-6            # 10x lower than v1 to avoid overwriting learned behavior
+lr_scheduler: cosine  # cosine decay lr -> lr/100 over total training steps
+lr_min_factor: 0.01   # final lr = 1e-6 * 0.01 = 1e-8
+batch_size: 2
+grad_accum: 4
+epochs: 5             # more passes to accumulate signal from sparse rewards
+max_completion_length: 128
+seed: 99              # fresh seed to avoid repeating same target order
+
+# MDP
+horizon: 6
+top_k: 30
+alpha: 0.0
+beta: 1.0
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

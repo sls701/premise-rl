@@ -1,0 +1,46 @@
+run_name: gspo_intra_v5
+
+# Resume from best v4 checkpoint; skip the high-entropy warmup phase
+resume_from: checkpoints/gspo_intra_v4/step_15
+
+# Data — new seed picks a different 200-target subset for broader coverage
+table: rl_train
+use_intra: false
+max_targets: 200
+seed: 55
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# GSPO hyperparameters
+group_size: 4
+temperature: 1.0          # resume mid-schedule; model is past exploration warmup
+temperature_final: 0.3    # anneal closer to eval (greedy) to reduce train/eval gap
+clip_eps: 0.2
+lr: 4.0e-7                # slightly lower LR for stable fine-tuning continuation
+batch_size: 2
+grad_accum: 4
+epochs: 4                 # more passes over the target pool
+max_completion_length: 128
+
+# MDP
+horizon: 6
+top_k: 40
+alpha: 0.0
+beta: 1.0
+tp_bonus: 0.05
+ema_decay: 0.75            # faster baseline decay prevents negative EMA updates from degrading the policy during degenerate streaks
+
+# Checkpointing / logging
+save_steps: 5
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

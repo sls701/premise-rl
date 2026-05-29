@@ -128,6 +128,7 @@ dmypy.json
 *.swp
 *.swo
 *~
+.claude
 
 # OS
 .DS_Store
@@ -138,3 +139,7 @@ Thumbs.db
 outputs/
 checkpoints/
 logs/
+.val
+results/*
+cache/*
+checkpoints/*

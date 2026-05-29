@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import logging
 import time as _time
 from dataclasses import dataclass
@@ -8,6 +9,12 @@ import diskcache
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# SQLite (diskcache) serializes writes and limits concurrent readers.
+# Under high asyncio concurrency the default thread-pool saturates with
+# lock-waiters, causing the 5s timeout to fire before the op completes.
+# A 2-thread executor serialises cache I/O, eliminating contention.
+_CACHE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="diskcache")
 
 GRAPH_EMBEDDING_URL = "https://api.theoremsearch.com/graph/embedding"
 
@@ -83,8 +90,8 @@ class SearchClient:
 
         try:
             cached = await asyncio.wait_for(
-                loop.run_in_executor(None, self._cache.get, cache_key),
-                timeout=5.0,
+                loop.run_in_executor(_CACHE_EXECUTOR, self._cache.get, cache_key),
+                timeout=30.0,
             )
         except asyncio.TimeoutError:
             logger.warning("cache get timed out for query=%r, skipping cache", query[:80])
@@ -115,8 +122,8 @@ class SearchClient:
                     )
                     try:
                         await asyncio.wait_for(
-                            loop.run_in_executor(None, self._cache.set, cache_key, results),
-                            timeout=5.0,
+                            loop.run_in_executor(_CACHE_EXECUTOR, self._cache.set, cache_key, results),
+                            timeout=30.0,
                         )
                     except asyncio.TimeoutError:
                         logger.warning("cache set timed out for query=%r, skipping", query[:80])

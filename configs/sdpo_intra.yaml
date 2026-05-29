@@ -7,6 +7,7 @@ max_targets: 200
 
 # Model
 model: Qwen/Qwen3-4B
+resume_from: checkpoints/gspo_intra_v2/step_10
 
 # LoRA
 lora_rank: 16
@@ -30,7 +31,7 @@ seed: 42
 
 # MDP
 horizon: 6
-top_k: 20
+top_k: 30
 alpha: 0.0
 beta: 1.0
 

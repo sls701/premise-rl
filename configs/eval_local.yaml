@@ -2,7 +2,7 @@ provider: local
 model: Qwen/Qwen3-4B
 temperature: 0.0
 max_tokens: 512
-concurrency: 4
+concurrency: 16
 use_vllm: false
 
 # Matcher
@@ -10,7 +10,7 @@ corpus_scope: dep_papers  # match training-time scope so TP/FP signal is compara
 
 # MDP hyperparameters
 horizon: 6
-top_k: 20
+top_k: 20            # match training top_k
 alpha: 0.0
 beta: 1.0
 
