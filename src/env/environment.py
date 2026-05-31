@@ -7,7 +7,7 @@ from uuid import UUID
 from src.data.load import Target
 from src.env.prompts import State
 from src.env.search_client import SearchClient
-from src.train.reward import step_reward, terminal_bonus
+from src.train.reward import novelty_bonus, step_reward, terminal_bonus
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ class PremiseSelectionEnv:
         top_k: int = 10,
         alpha: float = 0.1,
         beta: float = 1.0,
+        novelty_gamma: float = 0.0,
         include_context: bool = False,
     ):
         self._client = search_client
@@ -47,6 +48,7 @@ class PremiseSelectionEnv:
         self.top_k = top_k
         self.alpha = alpha
         self.beta = beta
+        self.novelty_gamma = novelty_gamma
         self.include_context = include_context
 
         self._target: Target | None = None
@@ -89,7 +91,8 @@ class PremiseSelectionEnv:
         new_tps = list(new_uuids & true_deps)
         new_fps = list(new_uuids - true_deps)
 
-        r_step = step_reward(len(new_tps), len(new_fps), self.alpha)
+        r_step = step_reward(len(new_tps), len(new_fps), self.alpha, self.top_k)
+        r_step += novelty_bonus(query, self._state.query_history, self.novelty_gamma)
 
         self._state.retrieved_uuids.update(new_uuids)
         self._state.query_history.append(query)

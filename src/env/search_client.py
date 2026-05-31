@@ -64,10 +64,12 @@ class SearchClient:
         cache_dir: str = "cache/search",
         concurrency: int = 16,
         request_timeout: float = 30.0,
+        max_retries: int = 5,
     ):
         self._cache = diskcache.Cache(cache_dir, size_limit=10 * 2**30)
         self._concurrency = concurrency
         self._request_timeout = request_timeout
+        self._max_retries = max_retries
         self._semaphore: asyncio.Semaphore | None = None
         self._http: httpx.AsyncClient | None = None
 
@@ -106,7 +108,7 @@ class SearchClient:
         params = {"query": query, "n_results": k}
 
         async with self._semaphore:
-            for attempt in range(3):
+            for attempt in range(self._max_retries):
                 _t0 = _time.monotonic()
                 try:
                     async with asyncio.timeout(self._request_timeout):
@@ -130,13 +132,13 @@ class SearchClient:
                     return results
                 except Exception as exc:
                     elapsed = _time.monotonic() - _t0
-                    if attempt == 2:
+                    if attempt == self._max_retries - 1:
                         logger.warning(
-                            "search failed after 3 attempts (last=%.2fs) for query=%r: %s",
-                            elapsed, query[:120], exc,
+                            "search failed after %d attempts (last=%.2fs) for query=%r: %s",
+                            self._max_retries, elapsed, query[:120], exc,
                         )
                         return []
-                    wait = 2 ** attempt
+                    wait = min(2 ** attempt, 8)
                     logger.debug(
                         "search attempt=%d failed (%.2fs): %s  retry in %ds",
                         attempt, elapsed, exc, wait,

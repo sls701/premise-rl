@@ -23,12 +23,15 @@ class _BatchCoordinator:
     """
 
     def __init__(self, model, tokenizer, temperature: float, max_new_tokens: int,
-                 window_s: float = 0.05):
+                 window_s: float = 0.05, repetition_penalty: float = 1.0,
+                 no_repeat_ngram_size: int = 0):
         self._model = model
         self._tokenizer = tokenizer
         self._temperature = temperature
         self._max_new_tokens = max_new_tokens
         self._window_s = window_s
+        self._repetition_penalty = repetition_penalty
+        self._no_repeat_ngram_size = no_repeat_ngram_size
         self._device = next(model.parameters()).device
         self._queue: asyncio.Queue | None = None
         self._task: asyncio.Task | None = None
@@ -90,6 +93,16 @@ class _BatchCoordinator:
         padded_len = input_ids.shape[1]
 
         do_sample = self._temperature > 0
+        gen_kwargs = {}
+        if self._repetition_penalty and self._repetition_penalty != 1.0:
+            gen_kwargs["repetition_penalty"] = self._repetition_penalty
+        if self._no_repeat_ngram_size and self._no_repeat_ngram_size > 0:
+            gen_kwargs["no_repeat_ngram_size"] = self._no_repeat_ngram_size
+        # Halt as soon as the tool call is complete — the episode loop only needs the
+        # parsed <tool_call>...</tool_call>. Without this, repetition_penalty suppresses
+        # EOS and the model rambles to max_new_tokens every turn (~3.5min/batch on 8B).
+        gen_kwargs["stop_strings"] = ["</tool_call>"]
+        gen_kwargs["tokenizer"] = self._tokenizer
         torch.cuda.empty_cache()
         with torch.no_grad():
             out = self._model.generate(
@@ -99,6 +112,7 @@ class _BatchCoordinator:
                 temperature=self._temperature if do_sample else None,
                 do_sample=do_sample,
                 pad_token_id=self._tokenizer.eos_token_id,
+                **gen_kwargs,
             )
         torch.cuda.synchronize()
 
@@ -159,12 +173,16 @@ class LocalAgent:
         temperature: float = 0.0,
         max_new_tokens: int = 512,
         use_vllm: bool = False,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ):
         self.model_id = model_id
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         self.use_vllm = use_vllm
+        self.repetition_penalty = repetition_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
         self._model = None
         self._tokenizer = None
         self._vllm_client = None
@@ -190,6 +208,7 @@ class LocalAgent:
             self.model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
+            attn_implementation="sdpa",
         )
         if self.checkpoint_dir and self.checkpoint_dir.exists():
             logger.info("Loading LoRA from %s", self.checkpoint_dir)
@@ -197,6 +216,8 @@ class LocalAgent:
         self._model.eval()
         self._coordinator = _BatchCoordinator(
             self._model, self._tokenizer, self.temperature, self.max_new_tokens,
+            repetition_penalty=self.repetition_penalty,
+            no_repeat_ngram_size=self.no_repeat_ngram_size,
         )
 
     def _load_vllm(self) -> None:
@@ -283,4 +304,6 @@ def make_local_agent(config: dict, checkpoint_dir: str | None = None) -> LocalAg
         temperature=config.get("temperature", 0.0),
         max_new_tokens=config.get("max_tokens", 512),
         use_vllm=config.get("use_vllm", False),
+        repetition_penalty=config.get("repetition_penalty", 1.0),
+        no_repeat_ngram_size=config.get("no_repeat_ngram_size", 0),
     )

@@ -1,0 +1,51 @@
+run_name: sdpo_intra_v4
+
+# Resume from best confirmed checkpoint (10.0% val recall on 50-ep)
+resume_from: checkpoints/sdpo_intra_v3/step_20_backup
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# SDPO hyperparameters
+group_size: 4
+temperature: 1.0
+beta_kl: 0.1
+use_contrastive: true
+contrastive_beta: 0.1
+min_winner_reward: 0.0
+
+lr: 1.0e-6
+lr_scheduler: cosine
+lr_min_factor: 0.01
+batch_size: 2
+grad_accum: 4
+epochs: 5
+max_completion_length: 128
+seed: 101
+
+# MDP — Phase 1: alpha=0.1 reduces degenerate groups (~67% → ~40%)
+#        Phase 4: novelty_gamma=0.1 penalises repeated queries
+horizon: 6
+top_k: 30
+alpha: 0.1
+beta: 1.0
+novelty_gamma: 0.1
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

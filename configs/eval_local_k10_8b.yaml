@@ -1,0 +1,25 @@
+provider: local
+model: Qwen/Qwen3-8B
+temperature: 0.0
+max_tokens: 256   # stop_strings halts at </tool_call>; 256 caps ramble turns
+concurrency: 16
+use_vllm: false
+
+# Anti-repetition decoding (same as 4B eval): repetition_penalty fixes greedy-decode
+# query repetition without granting a retrieval-budget advantage.
+repetition_penalty: 1.15
+no_repeat_ngram_size: 0
+
+# Matcher
+corpus_scope: dep_papers
+
+# MDP — k=10 to match the GPT-5.5 / Gemini baselines exactly (fair comparison).
+horizon: 6
+top_k: 10
+alpha: 0.0
+beta: 1.0
+novelty_gamma: 0.0
+
+# Paths
+cache_dir: cache
+results_dir: results

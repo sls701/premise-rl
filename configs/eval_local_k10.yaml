@@ -1,0 +1,34 @@
+provider: local
+model: Qwen/Qwen3-4B
+temperature: 0.0
+max_tokens: 512   # repetition_penalty penalizes the tool-call scaffold tokens (which
+                  # recur every turn), so after turn 1 the model needs room to push
+                  # through and re-emit a valid <tool_call>. 128/320 truncated it →
+                  # mean_q collapsed to ~2.3. 512 gives mean_q~5 (proven on smoke).
+                  # sdpa attention makes 512 fast (~20s/batch vs ~3min with eager).
+concurrency: 16
+use_vllm: false
+
+# Anti-repetition decoding: at greedy decoding the model otherwise repeats the
+# same query across turns (e.g. "dicontractible ENR" x5), collapsing to ~2 unique
+# queries and capping recall. These are standard small-model decoding settings;
+# the frontier baselines already have UQR~1.0 naturally, so this just removes a
+# degenerate failure mode rather than granting a retrieval-budget advantage.
+repetition_penalty: 1.15
+no_repeat_ngram_size: 0
+
+# Matcher
+corpus_scope: dep_papers
+
+# MDP hyperparameters — k=10 to match the GPT-5.5 / Gemini baselines exactly,
+# so a recall win is a fair model win and not a retrieval-budget advantage.
+# (eval_local.yaml uses k=20, which is NOT comparable to the k=10 baselines.)
+horizon: 6
+top_k: 10
+alpha: 0.0
+beta: 1.0
+novelty_gamma: 0.0   # eval reward shaping off; recall metric is unaffected anyway
+
+# Paths
+cache_dir: cache
+results_dir: results

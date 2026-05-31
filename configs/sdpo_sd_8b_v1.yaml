@@ -1,0 +1,47 @@
+run_name: sdpo_sd_8b_v1
+
+# Paper-faithful SDPO (Hübotter et al., arXiv 2601.20802): feedback-conditioned
+# self-distillation via symmetric JS divergence with an EMA-regularized teacher.
+# Distinct from sdpo_grpo_8b_v1 (the repo's winner-imitation+DPO variant).
+# resume_from: (optional — can resume from a combined-loss checkpoint to warm-start)
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 1000
+
+# Model — paper's default base is Qwen3-8B
+model: Qwen/Qwen3-8B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# SDPO self-distillation
+group_size: 4              # G rollouts per target (paper G=4)
+temperature: 1.0
+distill_top_k: 100         # top-K logits for the JS distillation (paper K=100)
+ema_alpha: 0.01            # EMA teacher coefficient (paper Table 4: alpha=0.01)
+
+lr: 1.0e-6
+batch_size: 2              # paper micro-batch 2
+grad_accum: 4
+epochs: 3
+max_completion_length: 128
+
+# MDP / env (reward only used to rank rollouts → pick the successful sibling for feedback)
+horizon: 6
+top_k: 30
+alpha: 0.1
+beta: 1.0
+novelty_gamma: 0.05
+
+# Checkpointing
+save_steps: 10
+seed: 108
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

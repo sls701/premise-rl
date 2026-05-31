@@ -1,0 +1,61 @@
+run_name: sdpo_grpo_combined_v1
+
+# Resume from step_30 of this run (6.3% val recall @ k=10) to continue improving.
+# global_step parses "step_30" → next saves are step_40, step_50, ...
+resume_from: checkpoints/sdpo_grpo_combined_v1/step_30
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 200
+
+# Model
+model: Qwen/Qwen3-4B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# Combined SDPO + GRPO objective.
+#   - GRPO auxiliary loss (grpo_lambda): group-normalized advantage trains on
+#     ALL groups with reward variance, including the ~67% that pure SDPO skips
+#     because the winner reward <= 0. This is the core fix for degenerate groups.
+#   - SDPO winner imitation: adds a clean supervised gradient when a group has a
+#     genuine TP-finding winner (reward > min_winner_reward). min_winner_reward
+#     is set above the max achievable novelty-only reward (~0.3) so SDPO only
+#     imitates episodes that actually found dependencies, not merely-diverse ones.
+group_size: 4
+temperature: 1.0
+beta_kl: 0.1
+use_contrastive: true
+contrastive_beta: 0.1
+min_winner_reward: 0.3
+grpo_lambda: 0.5
+
+lr: 1.0e-6
+lr_scheduler: cosine
+lr_min_factor: 0.01
+batch_size: 2
+grad_accum: 4
+epochs: 5
+max_completion_length: 128
+seed: 103
+
+# MDP — normalized FP penalty (reward.py divides alpha*new_fps by top_k) so a
+# fully-wasted search costs ~alpha (0.1) instead of alpha*top_k (3.0). Without
+# this, top_k=30 makes every episode negative and SDPO skips every group.
+horizon: 6
+top_k: 30
+alpha: 0.1
+beta: 1.0
+novelty_gamma: 0.05
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

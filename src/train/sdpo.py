@@ -162,6 +162,7 @@ async def _run_group_batched(
     top_k: int,
     alpha: float,
     beta: float,
+    novelty_gamma: float,
     temperature: float,
     max_new_tokens: int,
     device,
@@ -174,6 +175,7 @@ async def _run_group_batched(
         PremiseSelectionEnv(
             search_client=search_client,
             horizon=horizon, top_k=top_k, alpha=alpha, beta=beta,
+            novelty_gamma=novelty_gamma,
         )
         for _ in range(group_size)
     ]
@@ -225,6 +227,8 @@ async def _run_group_batched(
                 pad_token_id=tokenizer.eos_token_id,
                 logits_processor=LogitsProcessorList([_SafeLogitsProcessor()]),
                 use_cache=True,
+                stop_strings=["</tool_call>"],
+                tokenizer=tokenizer,
             )
         torch.cuda.synchronize()
         logger.info("turn=%d  generate done  shape=%s  gen=%.2fs",
@@ -363,6 +367,7 @@ def sdpo_update_step(
     contrastive_beta: float = 0.1,
     ema_baseline: float | None = None,
     ema_decay: float = 0.95,
+    grpo_lambda: float = 0.0,
 ) -> dict:
     """
     SDPO gradient update over episode_groups.
@@ -426,76 +431,101 @@ def sdpo_update_step(
             else ema_decay * ema_baseline + (1 - ema_decay) * mean_r
         )
 
-        if winner.total_reward <= min_winner_reward:
+        # ---- GRPO auxiliary loss (computed first — applies even for skipped groups) ----
+        # Group-normalized advantage gives gradient signal when reward variance exists,
+        # including groups where the SDPO winner reward is below threshold.
+        grpo_aux = torch.zeros(1, device=device)
+        has_grpo_signal = False
+        if grpo_lambda > 0.0:
+            ep_rewards = [ep.total_reward for ep in group]
+            rewards_t = torch.tensor(ep_rewards, dtype=torch.float32)
+            reward_std_g = rewards_t.std().item()
+            if reward_std_g > 1e-6:
+                reward_mean_g = rewards_t.mean().item()
+                advantages = [(r - reward_mean_g) / reward_std_g for r in ep_rewards]
+                grpo_terms: list[torch.Tensor] = []
+                for ep, adv in zip(group, advantages):
+                    ep_steps_g = [s for s in ep.steps if s.completion_ids]
+                    if not ep_steps_g:
+                        continue
+                    ep_lrs = [_seq_log_ratio(s, model, device) for s in ep_steps_g]
+                    ep_lrs = [lr for lr in ep_lrs if lr is not None]
+                    if ep_lrs:
+                        ep_seq_lr = torch.stack(ep_lrs).mean()
+                        grpo_terms.append(-ep_seq_lr * adv)
+                if grpo_terms:
+                    grpo_aux = torch.stack(grpo_terms).mean()
+                    has_grpo_signal = True
+
+        # ---- Check if SDPO winner imitation should apply ----
+        sdpo_applicable = winner.total_reward > min_winner_reward
+        winner_steps = [s for s in winner.steps if s.completion_ids] if sdpo_applicable else []
+
+        if not sdpo_applicable and not has_grpo_signal:
             skipped_groups += 1
-            logger.debug("group skipped: winner_reward=%.3f <= threshold=%.3f",
+            logger.debug("group skipped: winner_reward=%.3f <= threshold=%.3f, no GRPO signal",
                          winner.total_reward, min_winner_reward)
             continue
 
-        winner_steps = [s for s in winner.steps if s.completion_ids]
-        if not winner_steps:
+        if not winner_steps and not has_grpo_signal:
             skipped_groups += 1
             continue
 
-        active_groups += 1
-        torch.cuda.synchronize()
-
-        # ---- Per-step log-ratio: mean_t[log π_θ(a_t) - log π_ref(a_t)] ----
-        winner_log_ratios: list[torch.Tensor] = []
-        for step in winner_steps:
-            lr = _seq_log_ratio(step, model, device)
-            if lr is not None:
-                winner_log_ratios.append(lr)
-
-        if not winner_log_ratios:
-            skipped_groups += 1
-            active_groups -= 1
-            continue
-
-        # mean log-ratio across all turns of the winner episode
-        winner_seq_lr = torch.stack(winner_log_ratios).mean()
-
-        # L_sft + beta_kl * L_kl  (combined into a single expression)
-        # cur_token_lp = log π_θ, ref_token_lp = log π_ref
-        # L_sft = -mean[log π_θ] = -(winner_seq_lr + mean[log π_ref])
-        #       but mean[log π_ref] has no grad, so minimising:
-        # (1-beta_kl)*(-mean[log π_θ]) + beta_kl*(mean[log π_θ] - mean[log π_ref])
-        # = (1-beta_kl)*L_sft + beta_kl * L_kl
-        # = -(1-beta_kl-beta_kl)*mean[log π_θ] + const
-        # = -(1-2*beta_kl)*mean[log π_θ] + const
-        # Simpler: since log π_θ = winner_seq_lr + log π_ref (and ref has no grad):
-        # L = -(1-beta_kl)*winner_seq_lr + beta_kl*(winner_seq_lr)
-        # where the signs flip because log_ratio = log π_θ - log π_ref.
-        # Final: L_combined = -(1 - 2*beta_kl) * winner_seq_lr
-        # (positive beta_kl < 0.5 adds a mild KL penalty that pushes toward ref)
-        sft_kl_loss = -(1.0 - 2.0 * beta_kl) * winner_seq_lr
-
-        # ---- Contrastive loss (DPO-style, optional) ----
+        sft_kl_loss = torch.zeros(1, device=device)
         contrastive_loss = torch.zeros(1, device=device)
-        if use_contrastive and loser_idx != winner_idx:
-            loser = group[loser_idx]
-            loser_steps = [s for s in loser.steps if s.completion_ids]
-            if loser_steps:
-                loser_log_ratios: list[torch.Tensor] = []
-                for step in loser_steps:
-                    lr = _seq_log_ratio(step, model, device)
-                    if lr is not None:
-                        loser_log_ratios.append(lr)
-                if loser_log_ratios:
-                    loser_seq_lr = torch.stack(loser_log_ratios).mean()
-                    margin = contrastive_beta * (winner_seq_lr - loser_seq_lr)
-                    margin = margin.clamp(-10.0, 10.0)
-                    contrastive_loss = -F.logsigmoid(margin)
+        sdpo_contributed = False
 
-        group_loss = sft_kl_loss + contrastive_loss
+        if sdpo_applicable and winner_steps:
+            torch.cuda.synchronize()
+
+            # ---- Per-step log-ratio: mean_t[log π_θ(a_t) - log π_ref(a_t)] ----
+            winner_log_ratios: list[torch.Tensor] = []
+            for step in winner_steps:
+                lr = _seq_log_ratio(step, model, device)
+                if lr is not None:
+                    winner_log_ratios.append(lr)
+
+            if winner_log_ratios:
+                sdpo_contributed = True
+                winner_seq_lr = torch.stack(winner_log_ratios).mean()
+
+                # L_sft + beta_kl * L_kl  (combined into a single expression)
+                # cur_token_lp = log π_θ, ref_token_lp = log π_ref
+                # Final: L_combined = -(1 - 2*beta_kl) * winner_seq_lr
+                # (positive beta_kl < 0.5 adds a mild KL penalty that pushes toward ref)
+                sft_kl_loss = -(1.0 - 2.0 * beta_kl) * winner_seq_lr
+
+                # ---- Contrastive loss (DPO-style, optional) ----
+                if use_contrastive and loser_idx != winner_idx:
+                    loser = group[loser_idx]
+                    loser_steps = [s for s in loser.steps if s.completion_ids]
+                    if loser_steps:
+                        loser_log_ratios: list[torch.Tensor] = []
+                        for step in loser_steps:
+                            lr = _seq_log_ratio(step, model, device)
+                            if lr is not None:
+                                loser_log_ratios.append(lr)
+                        if loser_log_ratios:
+                            loser_seq_lr = torch.stack(loser_log_ratios).mean()
+                            margin = contrastive_beta * (winner_seq_lr - loser_seq_lr)
+                            margin = margin.clamp(-10.0, 10.0)
+                            contrastive_loss = -F.logsigmoid(margin)
+
+        # Nothing to learn from: neither SDPO imitation nor GRPO advantage fired.
+        if not sdpo_contributed and not has_grpo_signal:
+            skipped_groups += 1
+            continue
+
+        group_loss = sft_kl_loss + contrastive_loss + grpo_lambda * grpo_aux
         if not torch.isfinite(group_loss):
             logger.warning(
                 "Non-finite group loss (winner_reward=%.3f); skipping backward",
                 winner.total_reward,
             )
-            active_groups -= 1
             skipped_groups += 1
             continue
+
+        active_groups += 1
 
         group_loss = group_loss / max(n_groups - skipped_groups, 1)
         group_loss.backward()
@@ -615,6 +645,8 @@ def main() -> None:
     top_k            = cfg.get("top_k", 20)
     alpha            = cfg.get("alpha", 0.0)
     beta             = cfg.get("beta", 1.0)
+    novelty_gamma    = cfg.get("novelty_gamma", 0.0)
+    grpo_lambda      = cfg.get("grpo_lambda", 0.0)
     temperature      = cfg.get("temperature", 1.0)
     max_new_tokens   = cfg.get("max_completion_length", 128)
     beta_kl          = cfg.get("beta_kl", 0.1)
@@ -685,7 +717,7 @@ def main() -> None:
                         _run_group_batched(
                             t, model, tokenizer, sc,
                             system_prompt, group_size, horizon, top_k,
-                            alpha, beta, temperature, max_new_tokens, device,
+                            alpha, beta, novelty_gamma, temperature, max_new_tokens, device,
                         )
                         for t in targets
                     ])
@@ -721,6 +753,7 @@ def main() -> None:
                 contrastive_beta=contrastive_beta,
                 ema_baseline=ema_baseline,
                 ema_decay=ema_decay,
+                grpo_lambda=grpo_lambda,
             )
             ema_baseline = metrics.get("ema_baseline", ema_baseline)
             accum_count += 1

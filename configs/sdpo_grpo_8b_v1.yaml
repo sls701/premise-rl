@@ -1,0 +1,54 @@
+run_name: sdpo_grpo_8b_v1
+
+# Fresh start from base Qwen3-8B (LoRA adapters are model-specific — do NOT resume
+# from a 4B checkpoint). Scaling both knobs the 4B run was bottlenecked on:
+#   - larger base model (8B) for more math-literature knowledge (the root-cause gap)
+#   - 5x larger, more diverse training set (1000 distinct targets vs 200 repeated)
+# resume_from: (none)
+
+# Data
+table: rl_train
+use_intra: false
+max_targets: 1000
+
+# Model
+model: Qwen/Qwen3-8B
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# Combined SDPO + GRPO objective (same proven settings as sdpo_grpo_combined_v1)
+group_size: 4
+temperature: 1.0
+beta_kl: 0.1
+use_contrastive: true
+contrastive_beta: 0.1
+min_winner_reward: 0.3
+grpo_lambda: 0.5
+
+lr: 1.0e-6
+lr_scheduler: cosine
+lr_min_factor: 0.01
+batch_size: 2
+grad_accum: 4
+epochs: 3
+max_completion_length: 128
+seed: 108
+
+# MDP — normalized FP penalty (reward.py divides alpha*new_fps by top_k)
+horizon: 6
+top_k: 30
+alpha: 0.1
+beta: 1.0
+novelty_gamma: 0.05
+
+# Checkpointing / logging
+save_steps: 10
+logging_steps: 1
+
+# Paths
+cache_dir: cache
+results_dir: results
+checkpoint_dir: checkpoints

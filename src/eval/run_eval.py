@@ -61,6 +61,7 @@ async def _run_all(
     horizon = config.get("horizon", 6)
     alpha = config.get("alpha", 0.1)
     beta = config.get("beta", 1.0)
+    novelty_gamma = config.get("novelty_gamma", 0.0)
     cache_dir = config.get("cache_dir", "cache/search")
 
     trajectories: list[Trajectory] = []
@@ -75,6 +76,7 @@ async def _run_all(
                 top_k=top_k,
                 alpha=alpha,
                 beta=beta,
+                novelty_gamma=novelty_gamma,
             )
             return await run_episode(env, target, agent, system_prompt, top_k=top_k)
 
